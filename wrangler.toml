@@ -1,8 +1,8 @@
-name = "marketai-worker"
+name = "market-claude"  # or your worker name
 main = "MarketAI_Worker.js"
 compatibility_date = "2024-01-01"
 
 [[d1_databases]]
-binding     = "DB"
+binding = "DB"
 database_name = "marketai"
-database_id   = "YOUR_D1_DATABASE_ID_HERE"   # replace after running: wrangler d1 create marketai
+database_id = "2f35b597-4245-4fec-af1b-917c85afe18c"
