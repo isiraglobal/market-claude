@@ -39,9 +39,9 @@
       --blue-dim: rgba(77, 138, 240, .10);
       --purple: #a78bfa;
       --purple-dim: rgba(167, 139, 250, .10);
-      --text: #d8e8f5;
-      --text2: #8aa0be;
-      --muted: #4d6280;
+      --text: #e8f0fa;
+      --text2: #a0b8d4;
+      --muted: #6b84a6;
       --muted2: #2d4060;
       --font-ui: 'Syne', 'SF Pro Display', system-ui, sans-serif;
       --font-num: 'JetBrains Mono', 'Fira Code', monospace;
@@ -392,12 +392,12 @@
       display: flex;
       align-items: center;
       gap: 7px;
-      flex-shrink: 1;
+      flex-shrink: 0;
       min-width: 0;
       margin-left: auto;
       padding-left: 10px;
       border-left: 1px solid var(--border);
-      overflow: hidden
+      overflow: visible
     }
 
     .header-right select {
@@ -1858,50 +1858,42 @@
       color: var(--yellow) !important
     }
 
-    /* ── Exchange tabs ─────────────────────── */
-    .exchange-tabs {
-      display: flex;
-      align-items: center;
-      gap: 3px;
-      padding: 0 6px;
-      flex-shrink: 1;
-      overflow-x: auto;
-      min-width: 0;
-    }
-
-    .exchange-tabs::-webkit-scrollbar {
-      height: 0
-    }
-
-    .ex-tab {
-      padding: 4px 10px;
+    /* ── Exchange dropdown ─────────────────── */
+    .exchange-select {
+      font-size: 11px;
+      padding: 5px 24px 5px 10px;
       border-radius: var(--r);
-      font-size: 9px;
+      background: var(--surface);
+      border: 1px solid var(--border2);
+      color: var(--accent);
       font-weight: 800;
+      font-family: var(--font-num);
       letter-spacing: .6px;
       text-transform: uppercase;
-      color: var(--muted);
-      background: transparent;
-      border: 1px solid transparent;
       cursor: pointer;
       transition: var(--transition);
-      font-family: var(--font-num);
-      white-space: nowrap;
-      line-height: 1.4;
-      flex-shrink: 0;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2300d68f'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 8px center;
+      min-width: 90px;
     }
 
-    .ex-tab:hover {
-      color: var(--text);
+    .exchange-select:hover {
+      border-color: var(--accent);
+      box-shadow: 0 0 8px rgba(0, 214, 143, .12);
+    }
+
+    .exchange-select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(0, 214, 143, .08);
+    }
+
+    .exchange-select option {
       background: var(--surface2);
-      border-color: var(--border2);
-    }
-
-    .ex-tab.active {
-      color: var(--accent);
-      background: var(--accent-dim);
-      border-color: rgba(0, 214, 143, .22);
-      box-shadow: 0 0 8px rgba(0, 214, 143, .10);
+      color: var(--text);
+      font-weight: 700;
     }
 
     /* ── Responsive ────────────────────────── */
@@ -1962,15 +1954,15 @@
         <a class="nav-link admin-only" data-page="admin" style="display:none">Admin</a>
       </nav>
       <div class="header-right">
-      <div class="exchange-tabs" id="exchangeTabs">
-        <button class="ex-tab active" onclick="setExchangeTab('NSE', this)">NSE</button>
-        <button class="ex-tab" onclick="setExchangeTab('NASDAQ', this)">NASDAQ</button>
-        <button class="ex-tab" onclick="setExchangeTab('LSE', this)">LSE</button>
-        <button class="ex-tab" onclick="setExchangeTab('SGX', this)">SGX</button>
-        <button class="ex-tab" onclick="setExchangeTab('HKEX', this)">HKEX</button>
-        <button class="ex-tab" onclick="setExchangeTab('JPX', this)">JPX</button>
-        <button class="ex-tab" onclick="setExchangeTab('ASX', this)">ASX</button>
-      </div>
+      <select class="exchange-select" id="exchangeSelect" onchange="setExchangeDropdown(this.value)">
+        <option value="NSE">NSE</option>
+        <option value="NASDAQ">NASDAQ</option>
+        <option value="LSE">LSE</option>
+        <option value="SGX">SGX</option>
+        <option value="HKEX">HKEX</option>
+        <option value="JPX">JPX</option>
+        <option value="ASX">ASX</option>
+      </select>
       <button class="btn btn-ghost btn-sm" onclick="Router.navigate('settings')">Settings</button>
       <button class="btn btn-primary btn-sm" id="syncBtn" onclick="syncData()">↻ Sync</button>
       <div class="sync-dot" id="statusDot"></div>
@@ -2520,19 +2512,18 @@
       Router.refresh();
     }
 
-    function setExchangeTab(exchange, el) {
+    function setExchangeDropdown(exchange) {
       State.d.activeExchange = exchange;
       State.d.sheetTab = exchange;
       localStorage.setItem('mktai_exchange', exchange);
-      document.querySelectorAll('.ex-tab').forEach(btn => {
-        btn.classList.remove('active');
-      });
-      el.classList.add('active');
+      const sel = document.getElementById('exchangeSelect');
+      if (sel) sel.value = exchange;
 
       // Clear cached data and re-sync from the correct sheet
       State.d.snapshots = [];
       State.d.symbols = [];
       State.d.lastSync = null;
+      UI.setStatus('loading', 'Switching to ' + exchange + '...');
       Sync.run();
     }
 
@@ -2931,7 +2922,7 @@
           const chg = State.change(sym);
           const cls = chgCls(chg);
           const arr = chg ? (chg.pct >= 0 ? '▲' : '▼') : '';
-          return `<div class="ticker-item">
+          return `<div class="ticker-item" onclick="navigate('stockDetail',{sym:'${sym}'})">
         <span class="ticker-sym">${sym}</span>
         <span class="ticker-price ${cls}">${fmtPrice(p)}</span>
         <span class="ticker-chg ${cls}">${arr}${chg ? Math.abs(chg.pct).toFixed(2) + '%' : ''}</span>
@@ -3371,7 +3362,7 @@
 
     function dashWS(id) {
       State.d.activeWorkspace = State.d.workspaces.find(w => w.id === id);
-      document.querySelectorAll('.ws-tab').forEach(el => el.classList.toggle('active', el.textContent.trim() === State.d.activeWorkspace?.name));
+      Router.refresh();
     }
 
     function dashAddWS() {
@@ -3419,7 +3410,7 @@
     <div style="display:grid;grid-template-columns:1fr auto;gap:16px;width:100%;align-items:start">
       <div>
         <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
-          <button class="btn btn-ghost btn-sm" onclick="history.back()">Back</button>
+          <button class="btn btn-ghost btn-sm" onclick="Router.navigate('stocks')">← Back</button>
           <div style="font-size:22px;font-weight:800;letter-spacing:-.5px">${sym}</div>
           <span class="badge badge-gray">${State.d.activeExchange}</span>
           ${series.length ? `<span class="badge badge-gray">${series.length} snaps</span>` : ''}
@@ -3440,10 +3431,10 @@
   </div>
 
   <!-- Body -->
-  <div style="flex:1;min-height:0;overflow:hidden;display:grid;grid-template-columns:1fr 256px">
+  <div style="flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column">
 
-    <!-- Main left -->
-    <div style="overflow:auto;padding:20px 22px;display:flex;flex-direction:column;gap:20px;border-right:1px solid var(--border)">
+    <!-- Main content -->
+    <div style="padding:20px 22px;display:flex;flex-direction:column;gap:20px">
 
       <!-- Chart controls -->
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -3465,7 +3456,7 @@
 
       <!-- Stats row -->
       ${st ? `
-      <div class="stat-grid" style="grid-template-columns:repeat(6,1fr);gap:8px">
+      <div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px">
         ${[['Latest', fmtPrice(st.last), cls], ['High', fmtPrice(st.hi), 'up'], ['Low', fmtPrice(st.lo), 'dn'],
             ['Average', fmtPrice(st.avg), ''], ['Return', (st.totalPct >= 0 ? '+' : '') + st.totalPct.toFixed(2) + '%', st.totalPct >= 0 ? 'up' : 'dn'],
             ['Snapshots', st.count, '']].map(([l, v, c2]) => `
@@ -3488,7 +3479,7 @@
             <span class="badge badge-yellow">Valid Hammer</span>
             ${UI.sbar(h.strength_score)}
           </div>
-          <div class="stat-grid" style="grid-template-columns:repeat(5,1fr);gap:8px;margin-top:12px">
+          <div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin-top:12px">
             ${[['Downtrend', h.downtrend_pct + '% drop'], ['Entry', fmtPrice(h.entry_price)],
               ['Body', fmtPrice(h.body_size)], ['Lower Shadow', h.shadow_body_ratio?.toFixed(2) + 'x body'],
               ['Next Close', fmtPrice(h.next_price)]].map(([l, v]) => `
@@ -3532,7 +3523,8 @@
                 const prev = arr[i + 1]?.prices[sym];
                 const d = prev ? p - prev : null, pct = prev ? (d / prev * 100) : null;
                 const cc = d != null ? (d >= 0 ? 'up' : 'dn') : 'flat';
-                return `<tr>
+                const hidden = i >= 10 ? ' class="sd-extra-row" style="display:none"' : '';
+                return `<tr${hidden}>
               <td style="color:var(--muted);font-size:11px;font-family:var(--font-num)">${series.length - i}</td>
               <td style="font-size:12px">${snap.label || fmtDate(snap.ts)}</td>
               <td class="td-num" style="font-size:13px;font-weight:700">${fmtPrice(p)}</td>
@@ -3541,12 +3533,11 @@
             </tr>`;
               }).join('')}</tbody>
         </table></div>
+        ${series.length > 10 ? `<button class="btn btn-ghost btn-sm" id="sdShowAllBtn" onclick="_sdToggleAll()" style="width:100%;margin-top:8px">Show All ${series.length} Snapshots</button>` : ''}
       </div>
 
-    </div><!-- end left -->
-
-    <!-- Right panel -->
-    <div class="right-panel">
+    <!-- Right panel: Statistics & Signals -->
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;padding:0 22px 20px">
 
       <div class="info-card card-p-sm">
         <div class="card-title">Statistics</div>
@@ -3595,6 +3586,14 @@
     </div>
   </div>
 </div>`;
+
+        window._sdToggleAll = () => {
+          const rows = document.querySelectorAll('.sd-extra-row');
+          const btn = document.getElementById('sdShowAllBtn');
+          const showing = rows[0]?.style.display !== 'none';
+          rows.forEach(r => r.style.display = showing ? 'none' : '');
+          if (btn) btn.textContent = showing ? 'Show All ${series.length} Snapshots' : 'Show Recent 10 Only';
+        };
 
         requestAnimationFrame(() => {
           const canvas = document.getElementById('mainChart');
@@ -3699,7 +3698,9 @@
         window._stQ = v => { q = v; render(); };
         window._stTab = v => { tab = v; render(); };
       }
-      render();
+      // Show loading then render
+      c.innerHTML = '<div class="loading-row"><div class="spinner"></div>Loading stocks...</div>';
+      requestAnimationFrame(() => requestAnimationFrame(render));
     };
 
     // ── Patterns page ─────────────────────────────────────────
@@ -3761,7 +3762,8 @@
         window._patSc = v => { fScore = v; document.getElementById('patScVal').textContent = v; render(); };
         window._patReset = () => { fType = 'all'; fStatus = 'all'; fScore = 0; q = ''; render(); };
       }
-      render();
+      c.innerHTML = '<div class="loading-row"><div class="spinner"></div>Analyzing patterns...</div>';
+      requestAnimationFrame(() => requestAnimationFrame(render));
     };
 
     // ── Screener page ─────────────────────────────────────────
@@ -4303,9 +4305,8 @@
       if (ex) {
         State.d.activeExchange = ex;
         State.d.sheetTab = ex;
-        document.querySelectorAll('.ex-tab').forEach(btn => {
-          btn.classList.toggle('active', btn.textContent.trim() === ex);
-        });
+        const sel = document.getElementById('exchangeSelect');
+        if (sel) sel.value = ex;
       }
 
       // Ticker
