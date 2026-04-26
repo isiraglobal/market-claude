@@ -216,6 +216,7 @@
       display: grid;
       grid-template-rows: 54px 30px 1fr;
       height: 100vh;
+      max-width: 100vw;
       overflow: hidden;
       position: relative
     }
@@ -391,10 +392,12 @@
       display: flex;
       align-items: center;
       gap: 7px;
-      flex-shrink: 0;
+      flex-shrink: 1;
+      min-width: 0;
       margin-left: auto;
       padding-left: 10px;
-      border-left: 1px solid var(--border)
+      border-left: 1px solid var(--border);
+      overflow: hidden
     }
 
     .header-right select {
@@ -524,7 +527,8 @@
       overflow: hidden;
       display: flex;
       flex-direction: column;
-      min-height: 0
+      min-height: 0;
+      min-width: 0
     }
 
     /* ── Buttons ───────────────────────────── */
@@ -1860,7 +1864,13 @@
       align-items: center;
       gap: 3px;
       padding: 0 6px;
-      flex-shrink: 0;
+      flex-shrink: 1;
+      overflow-x: auto;
+      min-width: 0;
+    }
+
+    .exchange-tabs::-webkit-scrollbar {
+      height: 0
     }
 
     .ex-tab {
@@ -1878,6 +1888,7 @@
       font-family: var(--font-num);
       white-space: nowrap;
       line-height: 1.4;
+      flex-shrink: 0;
     }
 
     .ex-tab:hover {
@@ -2288,7 +2299,40 @@
 
     // ── Sync ──────────────────────────────────────────────────
     const Sync = (() => {
+      const WORKER_URL = 'https://market-claude.isiraglobal.workers.dev';
       const DEFAULT_ID = '1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA';
+
+      // Fetch price history from Cloudflare Worker (D1 database)
+      async function fetchFromWorker(market) {
+        const url = `${WORKER_URL}/history?market=${encodeURIComponent(market)}&limit=5000`;
+        const r = await fetch(url, { cache: 'no-store' });
+        if (!r.ok) throw new Error(`Worker HTTP ${r.status}`);
+        const json = await r.json();
+        if (json.error) throw new Error(json.error);
+        return json.data || [];
+      }
+
+      // Convert flat DB rows into snapshot format
+      function rowsToSnapshots(rows) {
+        const snapMap = {};
+        const symbols = new Set();
+        for (const row of rows) {
+          if (!row.timestamp || !row.symbol || row.price == null) continue;
+          const tsStr = row.timestamp.includes('T') ? row.timestamp : row.timestamp.replace(' ', 'T');
+          const ts = new Date(tsStr).getTime();
+          if (isNaN(ts)) continue;
+          const key = row.timestamp;
+          if (!snapMap[key]) {
+            snapMap[key] = { id: `snap_w_${ts}`, ts, label: row.timestamp, prices: {} };
+          }
+          snapMap[key].prices[row.symbol] = row.price;
+          symbols.add(row.symbol);
+        }
+        return {
+          snapshots: Object.values(snapMap).sort((a, b) => a.ts - b.ts),
+          symbols: [...symbols].sort()
+        };
+      }
 
       async function fetchCSV(id, tab) {
         const t = Date.now();
@@ -2322,61 +2366,90 @@
         State.d.syncing = true;
         const btn = document.getElementById('syncBtn');
         if (btn) { btn.disabled = true; btn.textContent = 'Syncing...'; }
-        UI.setStatus('loading', 'Fetching...');
+        UI.setStatus('loading', 'Syncing...');
         UI.progress(15);
 
         try {
+          const market = State.d.activeExchange || 'NSE';
           const id = Parser.extractId(State.d.sheetId) || DEFAULT_ID;
-          const tab = State.d.activeExchange || State.d.sheetTab || 'NSE';
-          UI.progress(30);
-          const csv = await fetchCSV(id, tab);
-          UI.progress(55);
-          const { snapshots: fresh, symbols } = Parser.parseSheet2(csv);
-          UI.progress(72);
+          const tab = market;
 
-          // Merge with existing (deduplicate by id)
-          // If in-memory was cleared (exchange switch), also clear DB
-          if (!State.d.snapshots.length) {
-            await DB.clearStore('snapshots');
+          // ── STEP 1: Fetch current data from Google Sheets (live prices) ──
+          UI.setStatus('loading', 'Fetching live prices...');
+          UI.progress(20);
+          let sheetSnaps = [], sheetSyms = [];
+          try {
+            const csv = await fetchCSV(id, tab);
+            const parsed = Parser.parseSheet2(csv);
+            sheetSnaps = parsed.snapshots;
+            sheetSyms = parsed.symbols;
+          } catch (sheetErr) {
+            console.warn('[Sync] Sheets fetch failed:', sheetErr.message);
           }
-          const existing = State.d.snapshots.length ? await DB.getAll('snapshots') : [];
-          const existIds = new Set(existing.map(s => s.id));
-          const toAdd = fresh.filter(s => !existIds.has(s.id));
+          UI.progress(45);
 
-          if (toAdd.length) await DB.putMany('snapshots', toAdd);
+          // ── STEP 2: Fetch historical data from Worker/D1 database ──
+          UI.setStatus('loading', 'Fetching history from DB...');
+          let dbSnaps = [], dbSyms = [];
+          try {
+            const rows = await fetchFromWorker(market);
+            if (rows.length > 0) {
+              const parsed = rowsToSnapshots(rows);
+              dbSnaps = parsed.snapshots;
+              dbSyms = parsed.symbols;
+            }
+          } catch (workerErr) {
+            console.warn('[Sync] Worker fetch failed:', workerErr.message);
+          }
+          UI.progress(70);
 
-          const all = [...existing, ...toAdd].sort((a, b) => a.ts - b.ts);
-          const allSyms = new Set([...symbols, ...all.flatMap(s => Object.keys(s.prices))]);
+          // ── STEP 3: Merge — DB history + Sheet current (deduplicate by id) ──
+          const allSnapsMap = new Map();
+          // Add DB snapshots first (history)
+          for (const s of dbSnaps) allSnapsMap.set(s.id, s);
+          // Add Sheet snapshots (current/live — overwrites if same id)
+          for (const s of sheetSnaps) allSnapsMap.set(s.id, s);
 
-          State.d.snapshots = all;
+          const merged = [...allSnapsMap.values()].sort((a, b) => a.ts - b.ts);
+          const allSyms = new Set([...dbSyms, ...sheetSyms]);
+
+          if (merged.length === 0) {
+            throw new Error('No data from Sheets or Database.\n\nCheck that the Google Sheet is public and the Worker is deployed.');
+          }
+
+          // Store in local IndexedDB
+          await DB.clearStore('snapshots');
+          if (merged.length) await DB.putMany('snapshots', merged);
+
+          State.d.snapshots = merged;
           State.d.symbols = [...allSyms].sort();
           State.d.lastSync = Date.now();
           State.d.sheetId = id;
-
           await DB.kvSet('lastSync', State.d.lastSync);
           await DB.kvSet('sheetId', id);
 
           UI.progress(100);
-          UI.setStatus('ok', `${all.length} snaps · ${State.d.symbols.length} sym · ${fmtAgo(State.d.lastSync)}`);
-          if (!silent) UI.toast(toAdd.length ? `+${toAdd.length} new snapshots synced` : 'Already up to date', 'success');
+          const src = [];
+          if (sheetSnaps.length) src.push(`${sheetSnaps.length} live`);
+          if (dbSnaps.length) src.push(`${dbSnaps.length} history`);
+          UI.setStatus('ok', `${merged.length} snaps · ${State.d.symbols.length} sym · ${src.join(' + ')} · ${fmtAgo(State.d.lastSync)}`);
+          if (!silent) UI.toast(`${merged.length} snapshots (${src.join(' + ')})`, 'success');
+
           UI.renderTicker();
           Router.refresh();
         } catch (e) {
           UI.setStatus('err', 'Sync failed');
-
           document.getElementById('pageContainer').innerHTML = `
         <div style="padding:40px; text-align:center;">
           <h2 style="color:#f0564d;">Data Load Failed</h2>
           <p style="color:#aaa; margin-top:10px;">
             ${e.message.replace(/\n/g, '<br>')}
           </p>
-          <button onclick="syncData()" style="margin-top:20px; padding:10px 20px;">
-            Retry Sync
-          </button>
+          <div style="margin-top:16px;display:flex;gap:10px;justify-content:center">
+            <button class="btn btn-primary" onclick="syncData()">Retry Sync</button>
+          </div>
         </div>
       `;
-
-          UI.toast('Fix sheet access or run via localhost', 'error');
 
           if (!State.d.snapshots.length) {
             State.d.snapshots = [
@@ -2437,7 +2510,7 @@
         Router.refresh();
       }
 
-      return { run, loadFromDB, clearMarket, fetchCSV };
+      return { run, loadFromDB, clearMarket, fetchCSV, WORKER_URL };
     })();
 
     function syncData() { Sync.run(); }
@@ -2726,7 +2799,7 @@
           <div class="${cls}" style="font-size:14px;font-weight:600">${chg ? fmtChg(chg) : '—'}</div>
           <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
             <div style="display:flex;gap:3px" id="expandPeriodBtns">
-              ${['all', '3m', '1m', '1w', '3d'].map(p => `<button class="period-btn${p === 'all' ? ' active' : ''}" onclick="expandPeriod('${sym}','${p}',this,'${type}')">${p.toUpperCase()}</button>`).join('')}
+              ${['all', '3m', '1m', '1w', '3d'].map(p => `<button class="period-btn${p === 'all' ? ' active' : ''}" onclick="expandPeriod('${sym}','${p}',this)">${p.toUpperCase()}</button>`).join('')}
             </div>
             <div style="display:flex;gap:3px" id="expandTypeBtns">
               <button class="period-btn${type === 'line' ? ' active' : ''}" onclick="expandType('${sym}','line',this)">Line</button>
@@ -2760,13 +2833,16 @@
 
         window._expandSym = sym;
         window._expandFull = series;
+        window._expandType = type;
+        window._expandPeriod = 'all';
       }
 
       return { drawLine, drawCandles, svgSpark, addTooltip, drawDistBar, openExpand };
     })();
 
     // Global expand handlers
-    window.expandPeriod = (sym, period, btn, type) => {
+    window.expandPeriod = (sym, period, btn) => {
+      window._expandPeriod = period;
       document.querySelectorAll('#expandPeriodBtns .period-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       const series = State.getSeries(sym, period);
@@ -2774,17 +2850,20 @@
       const tip = document.getElementById('expandTip');
       if (!canvas) return;
       const H = canvas.parentElement.clientHeight || 420;
+      const type = window._expandType || 'line';
       if (type === 'candle') Charts.drawCandles(canvas, series, sym, { h: H });
       else Charts.drawLine(canvas, series, sym, { h: H });
       Charts.addTooltip(canvas, tip);
     };
     window.expandType = (sym, type, btn) => {
+      window._expandType = type;
       document.querySelectorAll('#expandTypeBtns .period-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       const canvas = document.getElementById('expandCanvas');
       const tip = document.getElementById('expandTip');
       if (!canvas) return;
-      const series = window._expandFull || State.getSeries(sym, 'all');
+      const period = window._expandPeriod || 'all';
+      const series = State.getSeries(sym, period);
       const H = canvas.parentElement.clientHeight || 420;
       if (type === 'candle') Charts.drawCandles(canvas, series, sym, { h: H });
       else Charts.drawLine(canvas, series, sym, { h: H });
@@ -3009,7 +3088,7 @@
           if (+sig.rsi < 35) { score += 20; why.push('RSI oversold'); }
           else if (+sig.rsi < 50 && sig.shortTrend === 'UP') { score += 10; why.push('RSI rising'); }
           const ret = +sig.totalPct;
-          if (ret > 5) { score += 18; why.push(`+${ret.toFixed(1)}% return`); }
+          if (ret > 5) { score += 18; why.push(`+${ret.toFixed(2)}% return`); }
           else if (ret > 2) { score += 9; }
           const hammers = detectStrictHammers(sym);
           if (hammers.length) { score += 22; why.push('Hammer signal'); }
@@ -3046,9 +3125,9 @@
         else if (shortTrend === 'DOWN' && longTrend === 'DOWN') { signal = 'BEARISH'; sigColor = 'var(--red)'; }
         return {
           last, first, hi, lo, avg, ma5, ma10, ma20, shortTrend, longTrend,
-          rsi: rsi.toFixed(1), vol: vol.toFixed(2), signal, sigColor,
+          rsi: rsi.toFixed(2), vol: vol.toFixed(2), signal, sigColor,
           totalPct: ((last - first) / first * 100).toFixed(2),
-          fromHi: ((hi - last) / hi * 100).toFixed(1), fromLo: ((last - lo) / lo * 100).toFixed(1),
+          fromHi: ((hi - last) / hi * 100).toFixed(2), fromLo: ((last - lo) / lo * 100).toFixed(2),
           support: (lo + (hi - lo) * .25).toFixed(2), resistance: (lo + (hi - lo) * .75).toFixed(2), count: series.length
         };
       }
@@ -3169,8 +3248,8 @@
     <div class="stat-grid stat-grid-6">
       ${dashKpi('Symbols', sum.total, 'Tracked', 'accent')}
       ${dashKpi('Snapshots', d.snapshots.length, d.lastSync ? fmtAgo(d.lastSync) + ' ago' : 'Not synced', '')}
-      ${dashKpi('Advancing', sum.advances, ((sum.total ? ((sum.advances / sum.total) * 100) : 0).toFixed(1)) + '% of market', 'accent')}
-      ${dashKpi('Declining', sum.declines, ((sum.total ? ((sum.declines / sum.total) * 100) : 0).toFixed(1)) + '% of market', 'red')}
+      ${dashKpi('Advancing', sum.advances, ((sum.total ? ((sum.advances / sum.total) * 100) : 0).toFixed(2)) + '% of market', 'accent')}
+      ${dashKpi('Declining', sum.declines, ((sum.total ? ((sum.declines / sum.total) * 100) : 0).toFixed(2)) + '% of market', 'red')}
       ${dashKpi('Hammer Signals', hammers.length, 'Valid reversal signals', 'blue')}
       ${dashKpi('Unchanged', sum.unchanged, 'No price change', '')}
     </div>
@@ -3344,7 +3423,7 @@
           <div style="font-size:22px;font-weight:800;letter-spacing:-.5px">${sym}</div>
           <span class="badge badge-gray">${State.d.activeExchange}</span>
           ${series.length ? `<span class="badge badge-gray">${series.length} snaps</span>` : ''}
-          ${st ? `<span class="badge badge-gray">Vol ${st.vol.toFixed(1)}%</span>` : ''}
+          ${st ? `<span class="badge badge-gray">Vol ${st.vol.toFixed(2)}%</span>` : ''}
           ${hammers.length ? `<span class="badge badge-yellow">Hammer Signal</span>` : ''}
         </div>
         <div style="font-size:12px;color:var(--muted)">${series.length ? 'Since ' + fmtDateShort(series[0].ts) : 'No history'} ${st ? '  ·  Avg ' + fmtPrice(st.avg) : ''}</div>
