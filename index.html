@@ -1940,8 +1940,7 @@
         </div>
       </div>
       <div class="live-pill">
-        <div class="live-dot"></div>
-        <div class="live-txt">Live</div>
+        <div class="live-txt">EOD</div>
       </div>
       <nav class="main-nav" id="mainNav">
         <a class="nav-link" data-page="dashboard">Dashboard</a>
@@ -2304,26 +2303,49 @@
         return json.data || [];
       }
 
-      // Convert flat DB rows into snapshot format
+      // Convert flat DB rows into EOD snapshot format — one snapshot per calendar date.
+      // For each (date, symbol) pair, keeps the price from the row with the latest timestamp.
       function rowsToSnapshots(rows) {
-        const snapMap = {};
+        // dateMap: { 'YYYY-MM-DD': { maxTsBySymbol: {sym: ts}, prices: {sym: price}, maxTs: number } }
+        const dateMap = {};
         const symbols = new Set();
+
         for (const row of rows) {
           if (!row.timestamp || !row.symbol || row.price == null) continue;
           const tsStr = row.timestamp.includes('T') ? row.timestamp : row.timestamp.replace(' ', 'T');
           const ts = new Date(tsStr).getTime();
           if (isNaN(ts)) continue;
-          const key = row.timestamp;
-          if (!snapMap[key]) {
-            snapMap[key] = { id: `snap_w_${ts}`, ts, label: row.timestamp, prices: {} };
+
+          // Date key in local terms of the timestamp string (first 10 chars = YYYY-MM-DD)
+          const dateKey = row.timestamp.slice(0, 10);
+          if (!dateMap[dateKey]) {
+            dateMap[dateKey] = { maxTs: 0, prices: {}, symTs: {} };
           }
-          snapMap[key].prices[row.symbol] = row.price;
+          const entry = dateMap[dateKey];
+
+          // Only keep price if this timestamp is newer than what we already have for this symbol
+          const prevSymTs = entry.symTs[row.symbol] || 0;
+          if (ts >= prevSymTs) {
+            entry.prices[row.symbol] = row.price;
+            entry.symTs[row.symbol] = ts;
+          }
+          // Track overall max ts for snapshot id/label
+          if (ts > entry.maxTs) entry.maxTs = ts;
+
           symbols.add(row.symbol);
         }
-        return {
-          snapshots: Object.values(snapMap).sort((a, b) => a.ts - b.ts),
-          symbols: [...symbols].sort()
-        };
+
+        const snapshots = Object.entries(dateMap)
+          .map(([dateKey, entry]) => ({
+            id: `snap_w_${dateKey}`,
+            ts: new Date(dateKey + 'T00:00:00').getTime(), // start-of-day ts for chronological sort
+            label: dateKey,
+            prices: entry.prices,
+          }))
+          .filter(s => Object.keys(s.prices).length > 0)
+          .sort((a, b) => a.ts - b.ts);
+
+        return { snapshots, symbols: [...symbols].sort() };
       }
 
       async function fetchCSV(id, tab) {
@@ -2366,8 +2388,8 @@
           const id = Parser.extractId(State.d.sheetId) || DEFAULT_ID;
           const tab = market;
 
-          // ── STEP 1: Fetch current data from Google Sheets (live prices) ──
-          UI.setStatus('loading', 'Fetching live prices...');
+          // ── STEP 1: Fetch current data from Google Sheets (EOD prices) ──
+          UI.setStatus('loading', 'Fetching EOD prices...');
           UI.progress(20);
           let sheetSnaps = [], sheetSyms = [];
           try {
@@ -2422,10 +2444,10 @@
 
           UI.progress(100);
           const src = [];
-          if (sheetSnaps.length) src.push(`${sheetSnaps.length} live`);
+          if (sheetSnaps.length) src.push(`${sheetSnaps.length} today`);
           if (dbSnaps.length) src.push(`${dbSnaps.length} history`);
-          UI.setStatus('ok', `${merged.length} snaps · ${State.d.symbols.length} sym · ${src.join(' + ')} · ${fmtAgo(State.d.lastSync)}`);
-          if (!silent) UI.toast(`${merged.length} snapshots (${src.join(' + ')})`, 'success');
+          UI.setStatus('ok', `${merged.length} days · ${State.d.symbols.length} sym · ${src.join(' + ')} · ${fmtAgo(State.d.lastSync)}`);
+          if (!silent) UI.toast(`${merged.length} EOD days (${src.join(' + ')})`, 'success');
 
           UI.renderTicker();
           Router.refresh();
@@ -4321,17 +4343,9 @@
         document.querySelectorAll('.admin-only').forEach(el => el.style.display = '');
       }
 
-      // Auto-sync if no data or stale (>5min) during market hours
-      const isMarketHours = (() => {
-        const now = new Date();
-        const h = now.getHours(), m = now.getMinutes(), day = now.getDay();
-        if (day === 0 || day === 6) return false;
-        const mins = h * 60 + m;
-        return mins >= 555 && mins < 930; // 9:15 to 15:30 IST
-      })();
-
-      const stale = !State.d.lastSync || (Date.now() - State.d.lastSync > 5 * 60e3);
-      if (!State.d.snapshots.length || (isMarketHours && stale)) {
+      // Auto-sync if no data or EOD data is stale (>24h)
+      const stale = !State.d.lastSync || (Date.now() - State.d.lastSync > 24 * 60 * 60e3);
+      if (!State.d.snapshots.length || stale) {
         setTimeout(() => Sync.run(State.d.snapshots.length > 0), 1200);
       }
 
