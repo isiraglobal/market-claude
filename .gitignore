@@ -1,7 +1,10 @@
 node_modules/
 .netlify/
+.vercel/
 .DS_Store
 .env
 dist/
 build/
 *.log
+data.json
+userdata.json
