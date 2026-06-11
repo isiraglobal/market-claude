@@ -352,7 +352,7 @@ tbody tr:last-child td{border-bottom:none}
 //  Architecture: Frontend SPA + Cloudflare Workers (fetch, store, patterns)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ── API base (works both locally via dev server and on Netlify) ─────────────
+// ── API base (works both locally via dev server and on Vercel) ─────────────
 const API = '';
 
 // ── App State ────────────────────────────────────────────────────────────────
@@ -1031,7 +1031,7 @@ Pages.dashboard=function(el){
   </div>`;
 
   // Load AI briefing
-  
+  setTimeout(refreshAIBriefing, 50);
 };
 
 // ── MORE (MOBILE GRID MENU) ──────────────────────────────────────────────────
@@ -1085,7 +1085,7 @@ window.refreshAIBriefing=async function(){
     const ctx=`NSE market: ${sum.total} stocks, ${sum.advances} advancing, ${sum.declines} declining. Top gainers: ${gainers.map(g=>g.sym+' '+fc(g.c,true)).join(', ')}. Top losers: ${losers.map(l=>l.sym+' '+fc(l.c,true)).join(', ')}. Snapshots: ${S.snapshots.length}.`;
     const text=await askGroq('Give a 3-sentence professional market briefing with key insights and what traders should watch today.',ctx);
     el.innerHTML=text||'No AI analysis available.';
-  }catch(e){el.innerHTML='AI briefing unavailable. Set GROQ_API_KEY in Netlify environment variables.';}
+  }catch(e){el.innerHTML='AI briefing unavailable. Set GROQ_API_KEY in Vercel environment variables.';}
 };
 
 function glCard(title,list){
@@ -1728,7 +1728,7 @@ Pages.settings=function(el){
     <div class="card" style="margin-bottom:14px">
       <div class="card-hdr"><div class="card-title">Data Source</div></div>
       <div style="font-size:11px;color:var(--t2);margin-bottom:14px;line-height:1.7">
-        The app fetches from Google Sheets via a Netlify serverless function on every page load, and every 5 minutes via a cron job during market hours. All data is stored in <code style="color:var(--accent)">data.json</code> on the server.
+        The app fetches from Google Sheets via a Vercel serverless function on every page load, and every 10 minutes via a cron job during market hours. All data is stored in <code style="color:var(--accent)">data.json</code> on the server or in Vercel KV.
       </div>
       <div class="info-rows">
         <div class="ir"><span class="ir-key">Sheet ID</span><span class="ir-val" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis">10Wha7-e2_51oaK8MaJfvC6RacmHptXuKvtHMQBIvVXY</span></div>

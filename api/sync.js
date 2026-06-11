@@ -246,16 +246,16 @@ module.exports = async (req, res) => {
 
   try {
     const ts = Date.now();
-    // 1. Fetch Sheet1 (Current Prices)
-    const s1Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Sheet1&t=${ts}`;
+    // 1. Fetch SYMBOLS (Current Prices)
+    const s1Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=SYMBOLS&t=${ts}`;
     const s1Resp = await fetchURL(s1Url);
-    if (s1Resp.status !== 200) throw new Error(`Sheet1 returned HTTP ${s1Resp.status}`);
+    if (s1Resp.status !== 200) throw new Error(`SYMBOLS sheet returned HTTP ${s1Resp.status}`);
     const s1Rows = parseCSV(s1Resp.body);
 
-    // 2. Fetch Sheet2 (Price History)
-    const s2Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=Sheet2&t=${ts}`;
+    // 2. Fetch NSE (Price History)
+    const s2Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=NSE&t=${ts}`;
     const s2Resp = await fetchURL(s2Url);
-    if (s2Resp.status !== 200) throw new Error(`Sheet2 returned HTTP ${s2Resp.status}`);
+    if (s2Resp.status !== 200) throw new Error(`NSE sheet returned HTTP ${s2Resp.status}`);
     const s2Rows = parseCSV(s2Resp.body);
 
     if (s2Rows.length < 2) throw new Error("No snapshots parsed from Sheet2");

@@ -1,15 +1,15 @@
 # MarketAI — NSE Stock Market Intelligence Platform
 
-A complete, production-ready single-page application for real-time NSE (National Stock Exchange of India) stock market analysis and trading intelligence.
+A complete, production-ready single-page application for real-time NSE (National Stock Exchange of India) stock market analysis and trading intelligence, fully optimized for Vercel.
 
 ## Overview
 
 **MarketAI** is a serverless web application that:
-- Fetches live NSE stock prices via Google Sheets + GOOGLEFINANCE
-- Stores price history (rolling 10-day window) in a persistent data pool
+- Fetches live stock prices via Google Sheets (multi-market support: NSE, NASDAQ, SGX, Singapore, LSE,SGX,SGX,SGX,SGD,SGD,JPY,etc.)
+- Stores price history (rolling 200 snapshot window) in Vercel KV (production) or local files (development)
 - Detects technical patterns (Hammer, Doji, Engulfing, Morning Star)
 - Provides portfolio tracking, watchlists, and price alerts
-- Delivers momentum-based stock recommendations via AI (optional)
+- Delivers momentum-based stock recommendations via AI Briefing
 - Requires zero authentication — fully public, zero setup
 
 ## Architecture
@@ -17,20 +17,20 @@ A complete, production-ready single-page application for real-time NSE (National
 ```
 Google Sheet (GOOGLEFINANCE)
     ↓
-Google Apps Script (logs prices every 5 min)
+Google Apps Script (logs prices every 10 min)
     ↓
-Netlify Functions (/api/sync, /api/data)
+Vercel Serverless Functions (/api/sync, /api/data)
     ↓
-data.json (persistent price history)
+Vercel KV Store (production persistence) / data.json (local fallback)
     ↓
-Browser (single-file SPA with all features)
+Browser (single-file SPA with all features + localStorage caching)
 ```
 
 **Tech Stack:**
 - Frontend: Vanilla JavaScript, Canvas charts, SVG sparklines
-- Backend: Node.js Netlify Functions (zero dependencies)
-- Data: JSON files on Netlify filesystem
-- Hosting: Netlify (automatic deployment)
+- Backend: Node.js Vercel Serverless Functions (zero dependencies)
+- Data: Vercel KV (production persistence) or local JSON files (development)
+- Hosting: Vercel (automatic deployment)
 - Fonts: Inter (UI) + JetBrains Mono (data)
 
 ## Quick Start (5 minutes)
@@ -41,49 +41,43 @@ Share → Anyone with the link → Viewer
 Copy Sheet ID from URL: /spreadsheets/d/{SHEET_ID}/...
 ```
 
-### 2. Deploy to Netlify
-```
-Drag MarketAI 4 folder → app.netlify.com
-Your app is live at: https://[random-name].netlify.app
+### 2. Deploy to Vercel
+```bash
+# Install Vercel CLI
+npm install -g vercel
+
+# Run vercel deploy
+vercel
 ```
 
-### 3. Set Up Google Apps Script
+### 3. Setup Vercel KV Storage (Optional but Recommended)
+* Go to your project dashboard on Vercel.
+* Click **Storage** -> **Create Database** -> **KV**.
+* Connect the KV database to your project. This automatically creates the `KV_REST_API_URL` and `KV_REST_API_TOKEN` environment variables.
+
+### 4. Set Up Google Apps Script
 ```
 Google Sheet → Extensions → Apps Script
 Paste GoogleAppsScript.js content
-Run setupTriggers() once manually
-Accept permissions
+Run setupTriggers() once manually to authorize
 ```
 
-### 4. Enable Auto-Sync (Choose ONE)
-
-**Option A: cron-job.org (FREE)**
-- Create account at cron-job.org
-- URL: https://[your-site].netlify.app/api/sync
-- Method: POST
-- Schedule: Every 5 minutes
-
-**Option B: Netlify Pro**
-- Already configured in netlify.toml
-- Requires Netlify Pro plan
-- Runs Mon-Fri 03:00-10:00 UTC (= 08:30-15:30 IST)
-
-### Done!
-Open your app, prices auto-load, everything works.
+### 5. Done!
+Open your app, click "Sync" in the header, or let it auto-sync on load.
 
 ## Features
 
 ### Dashboard
 - Workspace tabs (Morning Scan, Intraday, Swing)
 - KPI boxes: Symbol count, snapshots, advancing/declining ratio
-- Top gainers and losers (today)
+- Top gainers and losers
 - Hammer reversal signals
 - AI-powered momentum recommendations
-- Optional AI market briefing (requires GROQ_API_KEY)
+- Optional AI market briefing (requires `GROQ_API_KEY`)
 
 ### Stocks
 - Searchable, sortable table of all symbols
-- Live prices, changes, 52-week high/low, snapshot count
+- Live prices, changes, high/low, snapshot count
 - Click any stock for detailed analysis
 
 ### Stock Detail
@@ -128,51 +122,26 @@ Open your app, prices auto-load, everything works.
 ## File Structure
 
 ```
-MarketAI 4/
 ├── index.html                    Single-file SPA (all HTML/CSS/JS)
-├── data.json                     Market data pool (auto-persisted)
-├── userdata.json                 Portfolio, watchlists, alerts
-├── netlify.toml                  Build + cron config
+├── vercel.json                   Vercel configurations (CORS, headers)
 ├── GoogleAppsScript.js           Paste into Google Sheets
-├── HOW_TO_USE.txt               Detailed setup guide
 ├── README.md                     This file
-└── netlify/functions/
-    ├── sync.js                   Fetch Google Sheet → update data.json
-    ├── sync-cron.js              Scheduled version
-    ├── data.js                   GET/POST market + user data
-    └── groq.js                   Optional AI proxy
+├── api/                          Vercel Serverless Functions
+│   ├── data.js                   GET/POST market + user data
+│   ├── sync.js                   Fetch Google Sheet → update Vercel KV / local files
+│   └── groq.js                   Optional AI proxy to Groq API
 ```
 
 ## Google Sheet Setup
 
-Your sheet needs two worksheets:
+Your spreadsheet needs a worksheet named **SYMBOLS** containing symbols and formulas, and separate sheets named after the markets (e.g. **NSE**, **NASDAQ**) to log price columns.
 
-### Sheet1 (Current Prices)
-```
-A1: "SYMBOL"           B1: =GOOGLEFINANCE("NSE:TCS","price")
-A2: "20MICRONS"        B2: =GOOGLEFINANCE("NSE:20MICRONS","price")
-A3: "TCS"              B3: =GOOGLEFINANCE("NSE:TCS","price")
-A4: "RELIANCE"         B4: =GOOGLEFINANCE("NSE:RELIANCE","price")
-...
-```
-
-### Sheet2 (Price History — Auto-Built)
-```
-Row 1:  SYMBOL      | 01/04/2026 15:00 | 02/04/2026 15:00 | ...
-Row 2:  20MICRONS   | 147.48           | 149.90           | ...
-Row 3:  TCS         | 3890.00          | 3902.00          | ...
-Row 4:  RELIANCE    | 2450.50          | 2455.30          | ...
-```
-
-The Google Apps Script automatically:
-- Appends new columns with timestamps
-- Fills in current prices
-- Deletes columns > 10 days old
-- Skips weekends and market closure
+Refer to [GoogleAppsScript.js](file:///Users/lakshitsinghvi/Documents/Stock%20Market/GoogleAppsScript.js) for details. The Google Apps Script automatically:
+- Synchronizes symbols from the main sheet
+- Appends new price columns with timestamps every 10 minutes
+- Automatically cleans up historical snapshots older than 7 days
 
 ## API Endpoints
-
-All endpoints are serverless functions in `netlify/functions/`:
 
 ### GET /api/data
 Returns combined JSON:
@@ -182,251 +151,56 @@ Returns combined JSON:
     "id": "snap_1712000000000_1",
     "ts": 1712000000000,
     "label": "01/04/2026 15:00",
-    "prices": { "TCS": 3890.00, "RELIANCE": 2450.50, ... }
+    "prices": { "TCS": 3890.00, "RELIANCE": 2450.50 }
   }],
-  "symbols": ["20MICRONS", "RELIANCE", "TCS", ...],
+  "symbols": ["RELIANCE", "TCS"],
   "lastSync": 1712000000000,
-  "portfolio": [...],
-  "watchlists": [...],
-  "alerts": [...]
+  "portfolio": [],
+  "watchlists": [],
+  "alerts": []
 }
 ```
 
 ### POST /api/data
-Saves user data:
-```json
-{
-  "portfolio": [...],
-  "watchlists": [...],
-  "watchlistItems": [...],
-  "alerts": [...],
-  "screeners": [...]
-}
-```
+Saves user data.
 
 ### POST /api/sync
-Fetches Google Sheet, updates data.json:
-```json
-{
-  "ok": true,
-  "snapshotsAdded": 5,
-  "totalSnapshots": 142,
-  "totalSymbols": 50,
-  "lastSync": 1712000000000
-}
-```
+Fetches Google Sheet, updates Vercel KV or local files.
 
 ### POST /api/groq (Optional)
-AI analysis proxy (requires GROQ_API_KEY env variable):
-```json
-{
-  "messages": [
-    { "role": "user", "content": "Analyze TCS stock" }
-  ]
-}
-```
-
-## Data Structures
-
-### data.json
-```json
-{
-  "snapshots": [
-    {
-      "id": "snap_1712000000000_1",
-      "ts": 1712000000000,
-      "label": "01/04/2026 15:00",
-      "prices": { "TCS": 3890.00, "RELIANCE": 2450.50 }
-    }
-  ],
-  "symbols": ["TCS", "RELIANCE"],
-  "lastSync": 1712000000000,
-  "syncCount": 42
-}
-```
-
-### userdata.json
-```json
-{
-  "portfolio": [
-    {
-      "id": "pf123",
-      "sym": "TCS",
-      "qty": 10,
-      "avgBuy": 3890.00,
-      "date": "2026-04-01"
-    }
-  ],
-  "watchlists": [
-    { "id": "wl123", "name": "Blue Chips", "desc": "" }
-  ],
-  "watchlistItems": [
-    { "id": "wli123", "wlId": "wl123", "sym": "TCS" }
-  ],
-  "alerts": [
-    { "id": "al123", "sym": "TCS", "cond": "above", "target": 4000, "active": true }
-  ],
-  "screeners": [
-    { "id": "scr123", "name": "High Momentum", "filters": {...} }
-  ]
-}
-```
-
-## Computations
-
-### Price Change
-Compare latest snapshot vs. second-to-latest for that symbol.
-
-### RSI (14-period)
-Standard Wilder's RSI formula on last 14 prices. Returns 50 if fewer than 15 prices.
-
-### Hammer Detection
-Pattern: `a > b AND cur > b AND (cur-b)/(a-b) > 0.5`
-- a, b, cur = three consecutive prices
-- Score = recovery strength (0-100)
-
-### Volatility
-Standard deviation of daily returns, expressed as percentage.
-
-### Auto-Picks Scoring (per symbol, 0-100)
-- +25 if price above moving average
-- +20 if RSI < 35 (oversold)
-- +10 if RSI < 50 and uptrending
-- +20 if period return > 5%
-- +10 if volatility < 2% and uptrending
-- Returns top 6 by score
+AI analysis proxy (requires `GROQ_API_KEY` env variable).
 
 ## Settings
 
 ### Optional: Enable AI Features
-Get free Groq API key for market analysis:
+Get a free Groq API key for market briefings:
 1. Create account at console.groq.com
 2. Generate API key
-3. Netlify dashboard → Site settings → Environment variables
-4. Key: GROQ_API_KEY
-5. Value: your key
-6. Deploy
-
-If not set, AI features gracefully degrade.
-
-### Optional: Change Google Sheet
-Edit `sync.js` line 8:
-```javascript
-const SHEET_ID = "10Wha7-e2_51oaK8MaJfvC6RacmHptXuKvtHMQBIvVXY";
-const SHEET_TAB = "Sheet2";
-```
-
-### Optional: Adjust Rolling Window
-Edit `sync.js` line 11:
-```javascript
-const MAX_SNAPSHOTS = 200; // keep up to 200 snapshots (~ 10 days)
-```
-
-## Troubleshooting
-
-### No Prices Showing
-1. Verify Google Sheet is public (Share → Anyone)
-2. Click "Sync" in app header
-3. Check data.json in Netlify Functions logs
-4. Verify Sheet2 has price data
-
-### Apps Script Not Logging
-1. Google Sheet → Extensions → Apps Script → Execution log
-2. Look for errors
-3. Verify Sheet1 has GOOGLEFINANCE formulas
-4. Run `forceLog()` manually to test
-5. Run `setupTriggers()` again
-
-### Slow Performance
-- Limits shown stocks to 300 in sidebar
-- Charts load on-demand
-- For large datasets: periodically clear old market data
+3. Go to Vercel Project settings → Environment variables
+4. Key: `GROQ_API_KEY`
+5. Value: [your API key]
+6. Redeploy or restart dev server.
 
 ## Development
 
-### Local Development with Netlify CLI
+### Local Development with Vercel CLI
 ```bash
-npm install -g netlify-cli
-netlify dev
-# Open http://localhost:8888
-# Functions work locally too
+npm install -g vercel
+vercel dev
+# Open http://localhost:3000
 ```
 
 ### Deploy Changes
 ```bash
 git add .
-git commit -m "Update prices"
-git push
-# Netlify auto-deploys
+git commit -m "Deploy Vercel migration"
+git push origin main
 ```
 
-## Performance
-
-- **data.json**: 100-500 KB (200 snapshots × 100-500 symbols)
-- **Page load**: < 1 sec on 4G
-- **Chart render**: < 100ms (uses requestAnimationFrame)
-- **Sparklines**: Inline SVG, instant
-- **Pattern detection**: O(n) per symbol, < 100ms for 500 symbols
-
 ## Security & Privacy
-
 - **No authentication**: Fully public, no login
-- **Shared data**: All users see same prices
-- **User data**: Stored locally in browser + server filesystem
-- **No sensitive data**: No passwords, keys, or personal info
-- **CORS enabled**: Safe for public data
+- **User data**: Stored in Vercel KV / local files (server-side) and `localStorage` (client-side)
 - **GROQ_API_KEY**: Environment variable (hidden from client)
 
-## Browser Support
-
-- Chrome/Edge: Full support
-- Firefox: Full support
-- Safari: Full support
-- Mobile: Responsive design, tested on iOS/Android
-
-## Known Limitations
-
-- Price history limited to 200 snapshots (~10 days)
-- No historical backtesting (only recent data)
-- No options or derivatives data
-- Prices update every 5 minutes (not real-time)
-- No advanced charting (moving averages, Bollinger Bands, etc.)
-- Pattern detection is basic (not ML-based)
-- User data stored on Netlify filesystem (not persisted across redeploys without Blobs)
-
-## Future Enhancements
-
-- [ ] Advanced charting (TradingView-like)
-- [ ] ML-based pattern recognition
-- [ ] More indicators (MACD, Stochastic, etc.)
-- [ ] Database persistence (Netlify Blobs or external DB)
-- [ ] Multi-exchange support (BSE, MCX, etc.)
-- [ ] Options chain data
-- [ ] Backtesting engine
-- [ ] Mobile app (React Native)
-- [ ] Real-time WebSocket prices
-- [ ] Advanced risk management
-
-## Support
-
-- Check Netlify logs: Dashboard → Logs
-- Check Apps Script logs: Extensions → Apps Script → Execution log
-- Verify all URLs and Sheet IDs are correct
-- Test functions manually: `/api/sync` in browser
-
 ## License
-
 MIT — Use freely for personal or commercial projects.
-
-## Credits
-
-Built with:
-- Vanilla JavaScript (no frameworks)
-- Netlify Functions (serverless)
-- Google Sheets API (price source)
-- Canvas & SVG (charts & sparklines)
-- Inter + JetBrains Mono fonts
-
----
-
-**Made for traders who love data, hate complexity.**
