@@ -259,8 +259,8 @@ function parseTimestamp(raw) {
     const ts = new Date(yr_num, +mo, +day, +hh, +mm, +ss).getTime();
     return isNaN(ts) ? null : ts;
   }
-  // dd/MM/yyyy [HH:mm[:ss]] (written by Google Apps Script)
-  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+  // dd/MM/yyyy [HH:mm[:ss]] or dd-MM-yyyy (written by Google Apps Script)
+  const dmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
   if (dmy) {
     const [, day, mon, yr, hh = "00", mm = "00", ss = "00"] = dmy;
     const yr_num = +yr;
@@ -425,6 +425,7 @@ module.exports = async (req, res) => {
     const priceMap = {};
     meta.forEach(m => { priceMap[m.ts + "_" + m.col] = {}; });
     const symsSet = new Set();
+    const allNseSymbols = new Set();
 
     for (let r = 1; r < s2Rows.length; r++) {
       const row = s2Rows[r];
@@ -433,6 +434,8 @@ module.exports = async (req, res) => {
         : mapping[r];
 
       if (!sym || sym === "SYMBOL" || sym.startsWith("#")) continue;
+
+      allNseSymbols.add(sym);
 
       for (const m of meta) {
         const p = parsePrice(row[m.col]);
@@ -516,10 +519,10 @@ module.exports = async (req, res) => {
       removedIds = removed.map(s => s.id);
     }
 
-    // Rebuild symbols from retained snapshots
-    const allSyms = new Set();
+    // Rebuild symbols from the sheet and snapshots
+    const allSyms = new Set(allNseSymbols);
     pool.snapshots.forEach(s => Object.keys(s.prices).forEach(k => allSyms.add(k)));
-    pool.symbols = [...allSyms].sort();
+    pool.symbols = [...allSyms].filter(Boolean).sort();
     pool.lastSync = Date.now();
     pool.syncCount = (pool.syncCount || 0) + 1;
 
