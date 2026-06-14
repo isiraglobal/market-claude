@@ -1,6 +1,11 @@
 // api/data.js
-// Serves the full data pool to the frontend (GET /api/data)
-// Accepts POST /api/data to update user data (portfolio, watchlists, etc.)
+// GET  /api/data → serves market data (chunked KV) + user data
+// POST /api/data → saves user data (portfolio, watchlists, alerts, screeners)
+//
+// Market data is stored as:
+//   "market-index" → { snapshots:[{id,ts,label}], symbols:[...], lastSync, syncCount }
+//   "market-snap:<id>" → { prices: { SYM: price } }   (one key per snapshot)
+// User data stays in a single "user-data" key (small — just IDs + numbers).
 
 const fs = require("fs");
 const path = require("path");
@@ -12,10 +17,7 @@ const USER_FILE = path.join(__dirname, "../userdata.json");
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-// Global in-memory cache with modification-time invalidation
-let cachedMarketData = null;
-let cachedMarketMtime = 0;
-
+// Local in-memory cache for user data (market data is always fresh from KV)
 let cachedUserData = null;
 let cachedUserMtime = 0;
 
@@ -27,7 +29,9 @@ const CORS_HEADERS = {
   "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate"
 };
 
-function requestREST(url, method, body = null) {
+// ── HTTP / KV helpers ─────────────────────────────────────────────────────────
+
+function requestREST(url, method, bodyStr = null) {
   return new Promise((resolve, reject) => {
     try {
       const parsedUrl = new URL(url);
@@ -35,41 +39,38 @@ function requestREST(url, method, body = null) {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port || 443,
         path: parsedUrl.pathname + parsedUrl.search,
-        method: method,
+        method,
         headers: {
           Authorization: `Bearer ${KV_TOKEN}`,
           "Content-Type": "application/json"
         }
       };
+      if (bodyStr) {
+        options.headers["Content-Length"] = Buffer.byteLength(bodyStr, "utf8");
+      }
       const req = https.request(options, (res) => {
         let responseBody = "";
         res.on("data", (chunk) => responseBody += chunk);
         res.on("end", () => {
-          try {
-            resolve(JSON.parse(responseBody));
-          } catch (e) {
-            resolve({ error: "Invalid JSON response from KV store", body: responseBody });
-          }
+          try { resolve(JSON.parse(responseBody)); }
+          catch (e) { resolve({ error: "Invalid JSON from KV", raw: responseBody }); }
         });
       });
       req.on("error", reject);
-      if (body) {
-        req.write(typeof body === "string" ? body : JSON.stringify(body));
-      }
+      if (bodyStr) req.write(bodyStr);
       req.end();
-    } catch (err) {
-      reject(err);
-    }
+    } catch (err) { reject(err); }
   });
 }
 
 async function kvGet(key) {
   if (!KV_URL || !KV_TOKEN) return null;
   try {
-    const res = await requestREST(`${KV_URL}/get/${key}`, "GET");
-    return res.result ? JSON.parse(res.result) : null;
+    const res = await requestREST(`${KV_URL}/get/${encodeURIComponent(key)}`, "GET");
+    if (!res.result) return null;
+    return JSON.parse(res.result);
   } catch (e) {
-    console.error(`[Vercel KV GET Error] key ${key}:`, e);
+    console.error(`[KV GET error] key="${key}":`, e.message);
     return null;
   }
 }
@@ -77,21 +78,69 @@ async function kvGet(key) {
 async function kvSet(key, value) {
   if (!KV_URL || !KV_TOKEN) return false;
   try {
-    await requestREST(`${KV_URL}/set/${key}`, "POST", JSON.stringify(value));
+    const bodyStr = JSON.stringify(JSON.stringify(value));
+    const res = await requestREST(`${KV_URL}/set/${encodeURIComponent(key)}`, "POST", bodyStr);
+    if (res.error) {
+      console.error(`[KV SET error] key="${key}":`, res.error);
+      return false;
+    }
     return true;
   } catch (e) {
-    console.error(`[Vercel KV SET Error] key ${key}:`, e);
+    console.error(`[KV SET error] key="${key}":`, e.message);
     return false;
   }
 }
 
+// ── Market data: chunked KV reader ───────────────────────────────────────────
+
+async function getMarketData() {
+  if (!KV_URL || !KV_TOKEN) return null;
+
+  // 1. Get the index (small, fast)
+  const index = await kvGet("market-index");
+  if (!index || !index.snapshots || index.snapshots.length === 0) {
+    console.warn("[Data] market-index empty or missing in KV");
+    return null;
+  }
+
+  // 2. Fetch all snapshot chunks in parallel (batches of 20 to avoid rate limits)
+  const snapMetas = index.snapshots;
+  const batchSize = 20;
+  const snapshots = [];
+
+  for (let i = 0; i < snapMetas.length; i += batchSize) {
+    const batch = snapMetas.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(m => kvGet(`market-snap:${m.id}`))
+    );
+    batch.forEach((m, j) => {
+      const snap = results[j];
+      if (snap && snap.prices && Object.keys(snap.prices).length > 0) {
+        snapshots.push({ id: m.id, ts: m.ts, label: m.label, prices: snap.prices });
+      }
+    });
+  }
+
+  if (snapshots.length === 0) {
+    console.warn("[Data] market-index had entries but no snap keys resolved");
+    return null;
+  }
+
+  return {
+    snapshots: snapshots.sort((a, b) => a.ts - b.ts),
+    symbols: index.symbols || [],
+    lastSync: index.lastSync || null,
+    syncCount: index.syncCount || 0
+  };
+}
+
+// ── Local file fallback (dev / Vercel KV unavailable) ────────────────────────
+
 function readLocalJSON(file, fallback) {
   try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, "utf8"));
-    }
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (e) {
-    console.error(`[Read Local Error] file ${file}:`, e);
+    console.error(`[Read Local Error] ${file}:`, e.message);
   }
   return fallback;
 }
@@ -101,53 +150,47 @@ function writeLocalJSON(file, data) {
     fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
     return true;
   } catch (e) {
-    console.error(`[Write Local Error] file ${file}:`, e);
+    // Expected on Vercel (read-only FS) — suppress noise
     return false;
   }
 }
 
+// ── Request handler ───────────────────────────────────────────────────────────
+
 module.exports = async (req, res) => {
-  // Handle CORS Preflight
   if (req.method === "OPTIONS") {
     res.writeHead(200, CORS_HEADERS);
     res.end();
     return;
   }
 
-  // GET Request
+  // ── GET ──────────────────────────────────────────────────────────────────────
   if (req.method === "GET") {
     let market = null;
     let user = null;
 
     if (KV_URL && KV_TOKEN) {
-      // 1. Try fetching from Vercel KV in parallel for faster serverless load speeds
+      // Fetch market (chunked) and user data in parallel
       const [mRes, uRes] = await Promise.all([
-        kvGet("market-data"),
+        getMarketData(),
         kvGet("user-data")
       ]);
       market = mRes;
       user = uRes;
     }
 
-    // 2. Fallback to local files with in-memory caching and mtime invalidation
+    // Fallback to local data.json for market (works in dev, not on Vercel)
     if (!market) {
-      try {
-        if (fs.existsSync(DATA_FILE)) {
-          const stat = fs.statSync(DATA_FILE);
-          if (stat.mtimeMs !== cachedMarketMtime || !cachedMarketData) {
-            cachedMarketData = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-            cachedMarketMtime = stat.mtimeMs;
-          }
-          market = cachedMarketData;
-        }
-      } catch (e) {
-        console.error("Error reading market cache:", e);
-      }
-      if (!market) {
-        market = { snapshots: [], symbols: [], lastSync: null };
+      market = readLocalJSON(DATA_FILE, null);
+      if (market && market.snapshots && market.snapshots.length > 0) {
+        console.log(`[Data] Serving from local file: ${market.snapshots.length} snaps`);
+      } else {
+        market = { snapshots: [], symbols: [], lastSync: null, syncCount: 0 };
+        console.warn("[Data] No market data available — KV empty and no local file");
       }
     }
 
+    // Fallback to local userdata.json
     if (!user) {
       try {
         if (fs.existsSync(USER_FILE)) {
@@ -158,84 +201,56 @@ module.exports = async (req, res) => {
           }
           user = cachedUserData;
         }
-      } catch (e) {
-        console.error("Error reading user cache:", e);
-      }
-      if (!user) {
-        user = { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] };
-      }
+      } catch (e) {}
+      if (!user) user = { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] };
     }
 
     res.writeHead(200, CORS_HEADERS);
     res.end(JSON.stringify({
-      snapshots: market?.snapshots || [],
-      symbols: market?.symbols || [],
-      lastSync: market?.lastSync || null,
-      syncCount: market?.syncCount || 0,
-      portfolio: user?.portfolio || [],
-      watchlists: user?.watchlists || [],
-      watchlistItems: user?.watchlistItems || [],
-      alerts: user?.alerts || [],
-      screeners: user?.screeners || []
+      snapshots: market.snapshots || [],
+      symbols: market.symbols || [],
+      lastSync: market.lastSync || null,
+      syncCount: market.syncCount || 0,
+      portfolio: user.portfolio || [],
+      watchlists: user.watchlists || [],
+      watchlistItems: user.watchlistItems || [],
+      alerts: user.alerts || [],
+      screeners: user.screeners || []
     }));
     return;
   }
 
-  // POST Request
+  // ── POST ──────────────────────────────────────────────────────────────────────
   if (req.method === "POST") {
     try {
-      // Node.js serverless functions on Vercel automatically parse body to req.body
       const body = req.body || {};
-      
-      // Fetch current user data from KV or local
+
       let user = null;
-      if (KV_URL && KV_TOKEN) {
-        user = await kvGet("user-data");
-      }
-      if (!user) {
-        user = readLocalJSON(USER_FILE, { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] });
-      }
-      if (!user && cachedUserData) {
-        user = cachedUserData;
-      }
-      if (!user) {
-        user = { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] };
-      }
+      if (KV_URL && KV_TOKEN) user = await kvGet("user-data");
+      if (!user) user = readLocalJSON(USER_FILE, null);
+      if (!user) user = { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] };
 
       const allowed = ["portfolio", "watchlists", "watchlistItems", "alerts", "screeners"];
       allowed.forEach(k => {
         if (body[k] !== undefined) {
-          if (!Array.isArray(body[k])) {
-            throw new Error(`${k} must be an array`);
-          }
+          if (!Array.isArray(body[k])) throw new Error(`${k} must be an array`);
           body[k].forEach((item, idx) => {
-            if (typeof item !== "object" || item === null) {
-              throw new Error(`${k}[${idx}] must be an object`);
-            }
+            if (typeof item !== "object" || item === null) throw new Error(`${k}[${idx}] must be an object`);
           });
           user[k] = body[k];
         }
       });
 
-      // Save user data
-      let saved = false;
-      if (KV_URL && KV_TOKEN) {
-        saved = await kvSet("user-data", user);
-      }
-      
-      // Always write to local file as secondary/development save
+      let kvSaved = false;
+      if (KV_URL && KV_TOKEN) kvSaved = await kvSet("user-data", user);
+
       const localSaved = writeLocalJSON(USER_FILE, user);
-      
-      // Update cache and mtime
       if (localSaved) {
-        try {
-          cachedUserData = user;
-          cachedUserMtime = fs.statSync(USER_FILE).mtimeMs;
-        } catch (e) {}
+        try { cachedUserData = user; cachedUserMtime = fs.statSync(USER_FILE).mtimeMs; } catch(e) {}
       }
 
       res.writeHead(200, CORS_HEADERS);
-      res.end(JSON.stringify({ ok: true, saved: saved || localSaved }));
+      res.end(JSON.stringify({ ok: true, saved: kvSaved || localSaved }));
       return;
     } catch (e) {
       res.writeHead(400, CORS_HEADERS);
@@ -244,7 +259,6 @@ module.exports = async (req, res) => {
     }
   }
 
-  // Method Not Allowed
   res.writeHead(405, CORS_HEADERS);
   res.end(JSON.stringify({ error: "Method Not Allowed" }));
 };

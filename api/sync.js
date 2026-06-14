@@ -1,5 +1,12 @@
 // api/sync.js
-// Fetches Google Sheet prices (Sheet1 and Sheet2) → merges into Vercel KV or local files
+// Fetches Google Sheet prices → merges into Vercel KV (chunked) or local files
+//
+// WHY CHUNKED?
+// A single pool of 200 snapshots × 2400+ symbols is ~4MB.
+// Vercel KV has a 1MB per-value cap — storing the whole pool in one key silently
+// fails (the SET succeeds but GET returns nothing). We split into:
+//   "market-index" → { snapshots: [{id, ts, label}], symbols: [...], lastSync, syncCount }
+//   "market-snap:<id>" → { prices: { SYM: price, ... } }  (one key per snapshot)
 
 const fs = require("fs");
 const path = require("path");
@@ -21,16 +28,19 @@ const CORS_HEADERS = {
   "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate"
 };
 
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
 function fetchURL(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { "User-Agent": "MarketAI-Sync/1.0" } }, (res) => {
       if (res.statusCode !== 200) {
+        // Non-200: try curl fallback
         try {
           const { execSync } = require("child_process");
           const body = execSync(`curl -s -L "${url}"`, { encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
           resolve({ status: 200, body });
         } catch (curlErr) {
-          console.error("[fetchURL curl error for non-200 fallback]:", curlErr.message);
+          console.error("[fetchURL curl fallback failed]:", curlErr.message);
           resolve({ status: res.statusCode, body: "" });
         }
         return;
@@ -39,19 +49,20 @@ function fetchURL(url) {
       res.on("data", (chunk) => body += chunk);
       res.on("end", () => resolve({ status: 200, body }));
     }).on("error", (err) => {
+      // Connection error: try curl fallback
       try {
         const { execSync } = require("child_process");
         const body = execSync(`curl -s -L "${url}"`, { encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
         resolve({ status: 200, body });
       } catch (curlErr) {
-        console.error("[fetchURL curl error on connection error]:", curlErr.message);
+        console.error("[fetchURL curl fallback on error]:", curlErr.message);
         reject(err);
       }
     });
   });
 }
 
-function requestREST(url, method, body = null) {
+function requestREST(url, method, bodyStr = null) {
   return new Promise((resolve, reject) => {
     try {
       const parsedUrl = new URL(url);
@@ -59,42 +70,145 @@ function requestREST(url, method, body = null) {
         hostname: parsedUrl.hostname,
         port: parsedUrl.port || 443,
         path: parsedUrl.pathname + parsedUrl.search,
-        method: method,
+        method,
         headers: {
           Authorization: `Bearer ${KV_TOKEN}`,
           "Content-Type": "application/json"
         }
       };
+      if (bodyStr) {
+        options.headers["Content-Length"] = Buffer.byteLength(bodyStr, "utf8");
+      }
       const req = https.request(options, (res) => {
         let responseBody = "";
         res.on("data", (chunk) => responseBody += chunk);
         res.on("end", () => {
           try { resolve(JSON.parse(responseBody)); }
-          catch (e) { resolve({ error: "Invalid JSON", body: responseBody }); }
+          catch (e) { resolve({ error: "Invalid JSON from KV", raw: responseBody }); }
         });
       });
       req.on("error", reject);
-      if (body) req.write(typeof body === "string" ? body : JSON.stringify(body));
+      if (bodyStr) req.write(bodyStr);
       req.end();
     } catch (err) { reject(err); }
   });
 }
 
+// ── KV helpers ────────────────────────────────────────────────────────────────
+
 async function kvGet(key) {
   if (!KV_URL || !KV_TOKEN) return null;
   try {
-    const res = await requestREST(`${KV_URL}/get/${key}`, "GET");
-    return res.result ? JSON.parse(res.result) : null;
-  } catch (e) { return null; }
+    const res = await requestREST(`${KV_URL}/get/${encodeURIComponent(key)}`, "GET");
+    if (!res.result) return null;
+    return JSON.parse(res.result);
+  } catch (e) {
+    console.error(`[KV GET error] key="${key}":`, e.message);
+    return null;
+  }
 }
 
 async function kvSet(key, value) {
   if (!KV_URL || !KV_TOKEN) return false;
   try {
-    await requestREST(`${KV_URL}/set/${key}`, "POST", JSON.stringify(value));
+    const bodyStr = JSON.stringify(JSON.stringify(value)); // double-stringify: KV stores strings
+    const res = await requestREST(`${KV_URL}/set/${encodeURIComponent(key)}`, "POST", bodyStr);
+    if (res.error) {
+      console.error(`[KV SET error] key="${key}":`, res.error, res.raw || "");
+      return false;
+    }
     return true;
-  } catch (e) { return false; }
+  } catch (e) {
+    console.error(`[KV SET error] key="${key}":`, e.message);
+    return false;
+  }
 }
+
+async function kvDel(key) {
+  if (!KV_URL || !KV_TOKEN) return;
+  try {
+    await requestREST(`${KV_URL}/del/${encodeURIComponent(key)}`, "POST", "");
+  } catch (e) {
+    console.error(`[KV DEL error] key="${key}":`, e.message);
+  }
+}
+
+// ── Chunked market data storage ───────────────────────────────────────────────
+// Index key: "market-index" → { snapshots:[{id,ts,label}], symbols:[...], lastSync, syncCount }
+// Per-snap:  "market-snap:<id>" → { prices: {SYM: price} }
+
+async function kvGetIndex() {
+  return await kvGet("market-index");
+}
+
+async function kvGetSnap(id) {
+  return await kvGet(`market-snap:${id}`);
+}
+
+async function kvSetIndex(index) {
+  return await kvSet("market-index", index);
+}
+
+async function kvSetSnap(id, prices) {
+  return await kvSet(`market-snap:${id}`, { prices });
+}
+
+async function kvDelSnap(id) {
+  await kvDel(`market-snap:${id}`);
+}
+
+// Read the full pool from chunked KV (index + all snap keys in parallel)
+async function kvGetFullPool() {
+  const index = await kvGetIndex();
+  if (!index || !index.snapshots || index.snapshots.length === 0) return null;
+
+  // Fetch all snapshot prices in parallel (batches of 20 to avoid rate limits)
+  const snapMetas = index.snapshots;
+  const batchSize = 20;
+  const snapshots = [];
+  for (let i = 0; i < snapMetas.length; i += batchSize) {
+    const batch = snapMetas.slice(i, i + batchSize);
+    const results = await Promise.all(batch.map(m => kvGetSnap(m.id)));
+    batch.forEach((m, j) => {
+      if (results[j] && results[j].prices) {
+        snapshots.push({ id: m.id, ts: m.ts, label: m.label, prices: results[j].prices });
+      }
+    });
+  }
+
+  return {
+    snapshots: snapshots.sort((a, b) => a.ts - b.ts),
+    symbols: index.symbols || [],
+    lastSync: index.lastSync || null,
+    syncCount: index.syncCount || 0
+  };
+}
+
+// Save the full pool to chunked KV (delete removed snaps, upsert new ones, update index)
+async function kvSetFullPool(pool, addedSnaps, removedIds) {
+  // 1. Delete KV keys for removed snapshots in parallel
+  if (removedIds.length > 0) {
+    await Promise.all(removedIds.map(id => kvDelSnap(id)));
+  }
+
+  // 2. Write new/updated snapshot price chunks in parallel (batches of 10)
+  const batchSize = 10;
+  for (let i = 0; i < addedSnaps.length; i += batchSize) {
+    const batch = addedSnaps.slice(i, i + batchSize);
+    await Promise.all(batch.map(s => kvSetSnap(s.id, s.prices)));
+  }
+
+  // 3. Write the index (small: just metadata, no prices)
+  const index = {
+    snapshots: pool.snapshots.map(s => ({ id: s.id, ts: s.ts, label: s.label })),
+    symbols: pool.symbols,
+    lastSync: pool.lastSync,
+    syncCount: pool.syncCount
+  };
+  return await kvSetIndex(index);
+}
+
+// ── CSV parsing ───────────────────────────────────────────────────────────────
 
 function parseCSV(text) {
   const lines = text.split(/\r?\n/);
@@ -102,7 +216,6 @@ function parseCSV(text) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    
     const cells = [];
     let cur = "", inQ = false;
     for (let j = 0; j < line.length; j++) {
@@ -126,9 +239,7 @@ function parseCSV(text) {
 function clean(v) {
   if (!v) return "";
   let s = v.trim();
-  if (s.startsWith('"') && s.endsWith('"')) {
-    s = s.slice(1, -1).trim();
-  }
+  if (s.startsWith('"') && s.endsWith('"')) s = s.slice(1, -1).trim();
   return s;
 }
 
@@ -137,9 +248,9 @@ function parseTimestamp(raw) {
   if (!s || s === "SYMBOL") return null;
   if (/^\d{10,}$/.test(s)) {
     const ts = +s;
-    if (ts >= 946684800000 && ts <= 4102444800000) return ts;
-    return null;
+    return (ts >= 946684800000 && ts <= 4102444800000) ? ts : null;
   }
+  // gviz Date(year, month0indexed, day [,h,m,s]) format
   const gviz = s.match(/^Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)$/i);
   if (gviz) {
     const [, yr, mo, day, hh = 0, mm = 0, ss = 0] = gviz;
@@ -148,35 +259,34 @@ function parseTimestamp(raw) {
     const ts = new Date(yr_num, +mo, +day, +hh, +mm, +ss).getTime();
     return isNaN(ts) ? null : ts;
   }
+  // dd/MM/yyyy HH:mm[:ss] (written by Google Apps Script)
   const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
   if (dmy) {
     const [, day, mon, yr, hh, mm, ss = "00"] = dmy;
     const yr_num = +yr;
     if (yr_num < 2000 || yr_num > 2100) return null;
-    const ts = new Date(`${yr}-${mon.padStart(2, "0")}-${day.padStart(2, "0")}T${hh.padStart(2, "0")}:${mm.padStart(2, "0")}:${ss.padStart(2, "0")}`).getTime();
+    const ts = new Date(`${yr}-${mon.padStart(2,"0")}-${day.padStart(2,"0")}T${hh.padStart(2,"0")}:${mm.padStart(2,"0")}:${ss.padStart(2,"0")}`).getTime();
     return isNaN(ts) ? null : ts;
   }
-  const d = new Date(s);
-  const ts = d.getTime();
-  if (!isNaN(ts) && ts >= 946684800000 && ts <= 4102444800000) return ts;
-  return null;
+  const ts = new Date(s).getTime();
+  return (!isNaN(ts) && ts >= 946684800000 && ts <= 4102444800000) ? ts : null;
 }
 
 function parsePrice(raw) {
   if (!raw) return null;
-  let s = clean(raw);
-  if (!s || ["#N/A", "N/A", "#VALUE!", "#REF!", "#ERROR!", "#NUM!"].includes(s)) return null;
+  const s = clean(raw);
+  if (!s || ["#N/A","N/A","#VALUE!","#REF!","#ERROR!","#NUM!","Loading..."].includes(s)) return null;
   let n = parseFloat(s);
   if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
   return isFinite(n) && n > 0 ? n : null;
 }
 
-// Banded DP Sequence Alignment to fix symbol mapping for old format
-function alignRows(s1, s2) {
-  const N = s2.length - 1; // s2 rows (prices)
-  const M = s1.length - 1; // s1 rows (symbols)
-  const W = 30; // band width
+// ── Banded DP Sequence Alignment (old sheet format only) ─────────────────────
 
+function alignRows(s1, s2) {
+  const N = s2.length - 1;
+  const M = s1.length - 1;
+  const W = 30;
   const dp = Array.from({ length: N + 1 }, () => ({}));
   const parent = Array.from({ length: N + 1 }, () => ({}));
 
@@ -190,62 +300,48 @@ function alignRows(s1, s2) {
   }
 
   dp[0][0] = 0;
-
   for (let i = 0; i <= N; i++) {
     const startJ = Math.max(0, i - W);
     const endJ = Math.min(M, i + W);
     for (let j = startJ; j <= endJ; j++) {
       if (dp[i][j] === undefined || dp[i][j] === -Infinity) continue;
-
-      // Match
-      if (i < N && j < M && Math.abs((i + 1) - (j + 1)) <= W) {
-        const nextScore = dp[i][j] + getScore(i + 1, j + 1);
-        if (dp[i + 1][j + 1] === undefined || nextScore > dp[i + 1][j + 1]) {
-          dp[i + 1][j + 1] = nextScore;
-          parent[i + 1][j + 1] = { prev_i: i, prev_j: j, action: "match" };
+      if (i < N && j < M && Math.abs((i+1)-(j+1)) <= W) {
+        const ns = dp[i][j] + getScore(i+1, j+1);
+        if (dp[i+1][j+1] === undefined || ns > dp[i+1][j+1]) {
+          dp[i+1][j+1] = ns; parent[i+1][j+1] = { prev_i:i, prev_j:j, action:"match" };
         }
       }
-
-      // Skip s2 row
-      if (i < N && Math.abs((i + 1) - j) <= W) {
-        const nextScore = dp[i][j] - 2;
-        if (dp[i + 1][j] === undefined || nextScore > dp[i + 1][j]) {
-          dp[i + 1][j] = nextScore;
-          parent[i + 1][j] = { prev_i: i, prev_j: j, action: "skip_s2" };
+      if (i < N && Math.abs((i+1)-j) <= W) {
+        const ns = dp[i][j] - 2;
+        if (dp[i+1][j] === undefined || ns > dp[i+1][j]) {
+          dp[i+1][j] = ns; parent[i+1][j] = { prev_i:i, prev_j:j, action:"skip_s2" };
         }
       }
-
-      // Skip s1 row
-      if (j < M && Math.abs(i - (j + 1)) <= W) {
-        const nextScore = dp[i][j] - 1;
-        if (dp[i][j + 1] === undefined || nextScore > dp[i][j + 1]) {
-          dp[i][j + 1] = nextScore;
-          parent[i][j + 1] = { prev_i: i, prev_j: j, action: "skip_s1" };
+      if (j < M && Math.abs(i-(j+1)) <= W) {
+        const ns = dp[i][j] - 1;
+        if (dp[i][j+1] === undefined || ns > dp[i][j+1]) {
+          dp[i][j+1] = ns; parent[i][j+1] = { prev_i:i, prev_j:j, action:"skip_s1" };
         }
       }
     }
   }
 
-  let best_j = M;
-  let max_score = -Infinity;
-  for (let j = Math.max(0, N - W); j <= Math.min(M, N + W); j++) {
-    if (dp[N][j] !== undefined && dp[N][j] > max_score) {
-      max_score = dp[N][j];
-      best_j = j;
-    }
+  let best_j = M, max_score = -Infinity;
+  for (let j = Math.max(0,N-W); j <= Math.min(M,N+W); j++) {
+    if (dp[N][j] !== undefined && dp[N][j] > max_score) { max_score = dp[N][j]; best_j = j; }
   }
-
   let curr_i = N, curr_j = best_j;
   const mapping = {};
   while (curr_i > 0 || curr_j > 0) {
     const p = parent[curr_i]?.[curr_j];
     if (!p) break;
     if (p.action === "match") mapping[curr_i] = s1[curr_j][0];
-    curr_i = p.prev_i;
-    curr_j = p.prev_j;
+    curr_i = p.prev_i; curr_j = p.prev_j;
   }
   return mapping;
 }
+
+// ── Main handler ──────────────────────────────────────────────────────────────
 
 module.exports = async (req, res) => {
   if (req.method === "OPTIONS") {
@@ -255,9 +351,15 @@ module.exports = async (req, res) => {
   }
 
   if (req.method === "DELETE") {
-    // Clear data pool
     const emptyPool = { snapshots: [], symbols: [], lastSync: null, syncCount: 0 };
-    if (KV_URL && KV_TOKEN) await kvSet("market-data", emptyPool);
+    // Clear chunked KV: first read the index to find all snap keys
+    if (KV_URL && KV_TOKEN) {
+      const index = await kvGetIndex();
+      if (index && index.snapshots) {
+        await Promise.all(index.snapshots.map(m => kvDelSnap(m.id)));
+      }
+      await kvSet("market-index", emptyPool);
+    }
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(emptyPool, null, 2), "utf8"); } catch(e) {}
     res.writeHead(200, CORS_HEADERS);
     res.end(JSON.stringify({ ok: true, message: "Market data cleared" }));
@@ -270,13 +372,13 @@ module.exports = async (req, res) => {
     let csvNse = req.body && req.body.csvNse;
 
     if (!csvSymbols || !csvNse) {
-      // 1. Fetch SYMBOLS (Current Prices)
+      // Fetch SYMBOLS sheet (current prices from GOOGLEFINANCE)
       const s1Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=SYMBOLS&t=${ts}`;
       const s1Resp = await fetchURL(s1Url);
       if (s1Resp.status !== 200) throw new Error(`SYMBOLS sheet returned HTTP ${s1Resp.status}`);
       csvSymbols = s1Resp.body;
 
-      // 2. Fetch NSE (Price History)
+      // Fetch NSE sheet (price history matrix)
       const s2Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=NSE&t=${ts}`;
       const s2Resp = await fetchURL(s2Url);
       if (s2Resp.status !== 200) throw new Error(`NSE sheet returned HTTP ${s2Resp.status}`);
@@ -286,46 +388,43 @@ module.exports = async (req, res) => {
     const s1Rows = parseCSV(csvSymbols);
     const s2Rows = parseCSV(csvNse);
 
-    if (s2Rows.length < 2) throw new Error("No snapshots parsed from NSE sheet");
+    if (s2Rows.length < 2) throw new Error("NSE sheet returned no data rows");
 
     const header = s2Rows[0];
     const firstColHeader = clean(header[0]).toUpperCase();
-    
-    // Check if new format (first column is symbol name)
-    const isNewFormat = firstColHeader.includes("SYMBOL") || isNaN(Number(s2Rows[1][0].trim()));
-    
+
+    // Detect new format: col 0 = "Symbol" string column
+    const isNewFormat = firstColHeader.includes("SYMBOL") || isNaN(Number((s2Rows[1]?.[0] || "").trim()));
+
     let mapping = {};
     if (!isNewFormat) {
-      // Run DP sequence alignment to map NSE rows to SYMBOLS
       mapping = alignRows(s1Rows, s2Rows);
     }
 
-    // Extract timestamps from columns
-    const meta = [];
+    // Parse timestamp columns — take ALL columns (up to MAX_SNAPSHOTS from right)
     const startCol = isNewFormat ? 1 : 0;
-    
-    // Process only the last MAX_SNAPSHOTS columns to keep payload small
     const colLimit = Math.max(startCol, header.length - MAX_SNAPSHOTS);
+    const meta = [];
     for (let c = colLimit; c < header.length; c++) {
       const colTs = parseTimestamp(header[c]);
       if (colTs) meta.push({ col: c, label: clean(header[c]), ts: colTs });
     }
 
-    // Initialize prices map
+    if (meta.length === 0) throw new Error("No timestamp columns found in NSE sheet header");
+    console.log(`[Sync] Found ${meta.length} timestamp columns, ${s2Rows.length - 1} symbol rows`);
+
+    // Build price map: ts_col → { SYM: price }
     const priceMap = {};
     meta.forEach(m => { priceMap[m.ts + "_" + m.col] = {}; });
     const symsSet = new Set();
 
     for (let r = 1; r < s2Rows.length; r++) {
       const row = s2Rows[r];
-      let sym = "";
-      if (isNewFormat) {
-        sym = clean(row[0]).toUpperCase().replace(/\s+/g, "");
-      } else {
-        sym = mapping[r]; // mapped via DP
-      }
+      let sym = isNewFormat
+        ? clean(row[0]).toUpperCase().replace(/\s+/g, "")
+        : mapping[r];
 
-      if (!sym || sym === "SYMBOL") continue;
+      if (!sym || sym === "SYMBOL" || sym.startsWith("#")) continue;
 
       for (const m of meta) {
         const p = parsePrice(row[m.col]);
@@ -346,83 +445,105 @@ module.exports = async (req, res) => {
       .filter(s => Object.keys(s.prices).length > 0)
       .sort((a, b) => a.ts - b.ts);
 
-    // Merge with existing pool
+    // ── Load existing pool ─────────────────────────────────────────────────────
     let pool = null;
+
     if (KV_URL && KV_TOKEN) {
-      pool = await kvGet("market-data");
+      // Try new chunked format first
+      pool = await kvGetFullPool();
+      // Migrate: if old single-key format exists, read it once and migrate
+      if (!pool) {
+        const oldPool = await kvGet("market-data");
+        if (oldPool && oldPool.snapshots && oldPool.snapshots.length > 0) {
+          console.log("[Sync] Migrating from old single-key KV format to chunked format...");
+          pool = oldPool;
+        }
+      }
     }
+
     if (!pool) {
       try {
         if (fs.existsSync(DATA_FILE)) {
           pool = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+          console.log(`[Sync] Loaded pool from local file: ${pool.snapshots?.length || 0} snaps`);
         }
       } catch (e) {}
     }
+
     if (!pool) {
       pool = { snapshots: [], symbols: [], lastSync: null, syncCount: 0 };
     }
 
+    // ── Merge new snapshots ────────────────────────────────────────────────────
     const existingIds = new Set((pool.snapshots || []).map(s => s.id));
-    const added = newSnaps.filter(s => !existingIds.has(s.id));
-
-    // Validate new snapshots
-    const validAdded = added.filter(snap => {
-      if (!snap.id || !snap.ts || typeof snap.ts !== "number") return false;
-      if (!snap.prices || typeof snap.prices !== "object") return false;
-      for (const sym in snap.prices) {
-        const p = snap.prices[sym];
+    const toAdd = newSnaps.filter(s => {
+      if (existingIds.has(s.id)) return false;
+      if (!s.id || !s.ts || typeof s.ts !== "number") return false;
+      if (!s.prices || typeof s.prices !== "object") return false;
+      // Validate prices
+      const priceVals = Object.values(s.prices);
+      if (priceVals.length === 0) return false;
+      for (const p of priceVals) {
         if (typeof p !== "number" || !isFinite(p) || p <= 0) return false;
       }
       return true;
     });
 
-    pool.snapshots = [...(pool.snapshots || []), ...validAdded];
+    pool.snapshots = [...(pool.snapshots || []), ...toAdd];
 
-    // Maintain rolling window
-    if (pool.snapshots.length > MAX_SNAPSHOTS) {
-      pool.snapshots = pool.snapshots.slice(pool.snapshots.length - MAX_SNAPSHOTS);
-    }
-
-    // Deduplicate and sort
-    const seen = new Set();
+    // Deduplicate by id
+    const seenIds = new Set();
     pool.snapshots = pool.snapshots.filter(s => {
-      const key = s.ts + "_" + s.id;
-      if (seen.has(key)) return false;
-      seen.add(key);
+      if (seenIds.has(s.id)) return false;
+      seenIds.add(s.id);
       return true;
     }).sort((a, b) => a.ts - b.ts);
 
-    // Rebuild symbol list from all retained snapshots
+    // Rolling window: track which snap ids get evicted
+    let removedIds = [];
+    if (pool.snapshots.length > MAX_SNAPSHOTS) {
+      const removed = pool.snapshots.splice(0, pool.snapshots.length - MAX_SNAPSHOTS);
+      removedIds = removed.map(s => s.id);
+    }
+
+    // Rebuild symbols from retained snapshots
     const allSyms = new Set();
     pool.snapshots.forEach(s => Object.keys(s.prices).forEach(k => allSyms.add(k)));
     pool.symbols = [...allSyms].sort();
-    
     pool.lastSync = Date.now();
     pool.syncCount = (pool.syncCount || 0) + 1;
 
-    // Save
+    console.log(`[Sync] Pool: ${pool.snapshots.length} snaps, ${pool.symbols.length} syms, +${toAdd.length} added, -${removedIds.length} evicted`);
+
+    // ── Save ──────────────────────────────────────────────────────────────────
     let kvSaved = false;
     if (KV_URL && KV_TOKEN) {
-      kvSaved = await kvSet("market-data", pool);
+      // Save in chunked format
+      kvSaved = await kvSetFullPool(pool, toAdd, removedIds);
+      // Delete the old single-key if it existed (cleanup after migration)
+      await kvDel("market-data").catch(() => {});
     }
-    
+
+    // Always save to local file as dev/fallback (fails silently on Vercel read-only FS)
     let fileSaved = false;
     try {
       fs.writeFileSync(DATA_FILE, JSON.stringify(pool, null, 2), "utf8");
       fileSaved = true;
-    } catch(e) {}
+    } catch (e) {}
 
     res.writeHead(200, CORS_HEADERS);
     res.end(JSON.stringify({
       ok: true,
-      snapshotsAdded: validAdded.length,
+      snapshotsAdded: toAdd.length,
       totalSnapshots: pool.snapshots.length,
       totalSymbols: pool.symbols.length,
       lastSync: pool.lastSync,
-      persisted: kvSaved || fileSaved
+      kvSaved,
+      fileSaved
     }));
+
   } catch (err) {
-    console.error("[Sync Error]:", err);
+    console.error("[Sync Error]:", err.message, err.stack);
     res.writeHead(500, CORS_HEADERS);
     res.end(JSON.stringify({ ok: false, error: err.message }));
   }
