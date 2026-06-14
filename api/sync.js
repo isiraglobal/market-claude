@@ -18,7 +18,7 @@ const DATA_FILE = path.join(__dirname, "../data.json");
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-const MAX_SNAPSHOTS = 365; // Maximum days of history to keep (one snapshot per calendar day)
+const MAX_SNAPSHOTS = 2000; // Maximum columns of history to keep
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -401,33 +401,25 @@ module.exports = async (req, res) => {
       mapping = alignRows(s1Rows, s2Rows);
     }
 
-    // ── "Last snapshot per calendar day" column selection ──────────────────────
-    // The NSE sheet has many intraday columns (every 5 min during market hours).
-    // We only keep the LAST column of each calendar date (IST, UTC+5:30).
-    // This gives clean end-of-day prices and keeps total snapshots tiny.
+    // ── Get all columns from the sheet ──────────────────────
     const startCol = isNewFormat ? 1 : 0;
-    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // IST = UTC+5:30
 
-    // 1. Scan ALL columns (no pre-limit), group by IST date, keep latest per date
-    const dayLatest = {}; // "YYYY-MM-DD" → {col, label, ts}
+    // 1. Scan ALL columns and keep all valid timestamped columns
+    const meta = [];
     for (let c = startCol; c < header.length; c++) {
       const colTs = parseTimestamp(header[c]);
       if (!colTs) continue;
-      // Convert to IST to get the correct calendar date
-      const istDate = new Date(colTs + IST_OFFSET_MS);
-      const dateKey = istDate.toISOString().slice(0, 10); // YYYY-MM-DD
-      if (!dayLatest[dateKey] || colTs > dayLatest[dateKey].ts) {
-        dayLatest[dateKey] = { col: c, label: clean(header[c]), ts: colTs };
-      }
+      meta.push({ col: c, label: clean(header[c]), ts: colTs });
     }
 
-    // 2. Sort by date ascending, keep last MAX_SNAPSHOTS days
-    const meta = Object.values(dayLatest)
-      .sort((a, b) => a.ts - b.ts)
-      .slice(-MAX_SNAPSHOTS);
+    // 2. Sort by timestamp ascending, keep last MAX_SNAPSHOTS columns
+    meta.sort((a, b) => a.ts - b.ts);
+    if (meta.length > MAX_SNAPSHOTS) {
+      meta.splice(0, meta.length - MAX_SNAPSHOTS);
+    }
 
     if (meta.length === 0) throw new Error("No timestamp columns found in NSE sheet header");
-    console.log(`[Sync] Columns in sheet: ${header.length - startCol}, unique days: ${Object.keys(dayLatest).length}, using: ${meta.length} end-of-day columns, ${s2Rows.length - 1} symbol rows`);
+    console.log(`[Sync] Columns in sheet: ${header.length - startCol}, using: ${meta.length} snapshot columns, ${s2Rows.length - 1} symbol rows`);
 
     // Build price map: ts_col → { SYM: price }
     const priceMap = {};
@@ -507,16 +499,15 @@ module.exports = async (req, res) => {
 
     pool.snapshots = [...(pool.snapshots || []), ...toAdd];
 
-    // Deduplicate by IST calendar date: keep only the LATEST snapshot per date.
-    // This handles re-syncs where the same day might appear with a different
-    // column index (and thus a different id) after a sheet rollup.
-    const dateBest = {}; // "YYYY-MM-DD" → snapshot
+    // Deduplicate by timestamp (ts): keep only the latest entry if duplicate timestamps occur.
+    // This handles cases where a column shifted index (different id) but has the same timestamp.
+    const tsBest = {}; // ts_number → snapshot
     for (const s of pool.snapshots) {
-      const istDate = new Date(s.ts + IST_OFFSET_MS);
-      const dk = istDate.toISOString().slice(0, 10);
-      if (!dateBest[dk] || s.ts > dateBest[dk].ts) dateBest[dk] = s;
+      if (!tsBest[s.ts] || s.id > tsBest[s.ts].id) {
+        tsBest[s.ts] = s;
+      }
     }
-    pool.snapshots = Object.values(dateBest).sort((a, b) => a.ts - b.ts);
+    pool.snapshots = Object.values(tsBest).sort((a, b) => a.ts - b.ts);
 
     // Rolling window: evict oldest dates beyond MAX_SNAPSHOTS
     let removedIds = [];
