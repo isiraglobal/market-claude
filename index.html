@@ -1941,7 +1941,7 @@ function closeModal(){
 function renderTicker(){
   const el=document.getElementById('ticker');
   const inner=document.getElementById('tickerInner');
-  const validSyms=S.symbols.filter(s=>{const st=stats(s);return st&&st.count>=2;});
+  const validSyms=S.symbols.filter(s=>{const st=stats(s);return st&&st.count>=1;});
   if(!validSyms.length){el.style.display='none';return;}
   el.style.display='block';
   const items=validSyms.slice(0,60).map(sym=>{
@@ -1962,7 +1962,7 @@ function setSbTab(t,el){
 }
 function renderSidebar(){
   const q=(document.getElementById('sbSearch')?.value||'').toUpperCase();
-  let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=2;});
+  let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=1;});
   if(q)syms=syms.filter(s=>s.includes(q));
   if(sbTab==='gain')syms=syms.filter(s=>{const c=change(s);return c&&c.pct>0.01;});
   if(sbTab==='loss')syms=syms.filter(s=>{const c=change(s);return c&&c.pct<-0.01;});
@@ -2186,7 +2186,7 @@ Pages.stocks=function(el){
   const pageSize=100;
 
   function render(){
-    let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=2;});
+    let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=1;});
     if(q)syms=syms.filter(s=>s.includes(q.toUpperCase()));
     if(tab==='gain')syms=syms.filter(s=>{const c=change(s);return c&&c.pct>0.01;});
     if(tab==='loss')syms=syms.filter(s=>{const c=change(s);return c&&c.pct<-0.01;});
