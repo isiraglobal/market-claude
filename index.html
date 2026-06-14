@@ -1682,7 +1682,13 @@ function fetchFromGoogleSheetsRealtime() {
 async function fetchData(){
   try {
     const r=await fetch(`${API}/api/data`);
-    if(r.ok) return await r.json();
+    if(r.ok) {
+      const data = await r.json();
+      if (data && data.snapshots && data.snapshots.length > 0) {
+        return data;
+      }
+      console.warn('API returned empty snapshots, trying other fallback methods...');
+    }
   } catch (err) {
     console.warn('API fetch failed, trying local storage cache...', err);
   }
