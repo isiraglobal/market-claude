@@ -1576,7 +1576,13 @@ function fetchFromGoogleSheetsRealtime() {
       });
     }
 
-    Promise.all([fetchJSONP('SYMBOLS'), fetchJSONP('NSE')])
+    Promise.all([
+      fetchJSONP('SYMBOLS').catch(err => {
+        console.warn('SYMBOLS sheet fetch failed, proceeding with NSE sheet only:', err);
+        return null;
+      }),
+      fetchJSONP('NSE')
+    ])
       .then(([symbolsData, nseData]) => {
         try {
           // Extract symbols rows
@@ -1600,14 +1606,17 @@ function fetchFromGoogleSheetsRealtime() {
           if (s2Rows.length < 2) throw new Error("No snapshots parsed from direct NSE fetch");
 
           let header = [];
+          let headerFromCols = false;
           if (nseData.table.cols && nseData.table.cols.length > 0) {
             header = nseData.table.cols.map(c => c.label || '');
+            headerFromCols = true;
           }
-          if (header.length === 0 || (!header[0].toUpperCase().includes('SYMBOL') && s2Rows.length > 0)) {
+          if (header.length === 0 || (!String(header[0] || '').toUpperCase().includes('SYMBOL') && s2Rows.length > 0)) {
             header = s2Rows[0] || [];
+            headerFromCols = false;
           }
 
-          const firstColHeader = (header[0] || '').trim().toUpperCase();
+          const firstColHeader = String(header[0] || '').trim().toUpperCase();
           const isNewFormat = firstColHeader.includes("SYMBOL") || isNaN(Number(s2Rows[0]?.[0] || ''));
           const startCol = isNewFormat ? 1 : 0;
 
@@ -1616,14 +1625,14 @@ function fetchFromGoogleSheetsRealtime() {
           const colLimit = Math.max(startCol, header.length - MAX_SNAPSHOTS);
           for (let c = colLimit; c < header.length; c++) {
             const colTs = parseSheetTimestamp(header[c]);
-            if (colTs) meta.push({ col: c, label: header[c].trim(), ts: colTs });
+            if (colTs) meta.push({ col: c, label: String(header[c] || '').trim(), ts: colTs });
           }
 
           const priceMap = {};
           meta.forEach(m => { priceMap[m.ts + "_" + m.col] = {}; });
           const symsSet = new Set();
 
-          const startRow = (nseData.table.cols && nseData.table.cols.length > 0) ? 0 : 1;
+          const startRow = headerFromCols ? 0 : 1;
           for (let r = startRow; r < s2Rows.length; r++) {
             const row = s2Rows[r];
             if (!row || row.length === 0) continue;
