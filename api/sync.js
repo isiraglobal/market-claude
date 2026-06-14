@@ -18,7 +18,7 @@ const DATA_FILE = path.join(__dirname, "../data.json");
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-const MAX_SNAPSHOTS = 200; // Rolling window size
+const MAX_SNAPSHOTS = 365; // Maximum days of history to keep (one snapshot per calendar day)
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -401,17 +401,33 @@ module.exports = async (req, res) => {
       mapping = alignRows(s1Rows, s2Rows);
     }
 
-    // Parse timestamp columns — take ALL columns (up to MAX_SNAPSHOTS from right)
+    // ── "Last snapshot per calendar day" column selection ──────────────────────
+    // The NSE sheet has many intraday columns (every 5 min during market hours).
+    // We only keep the LAST column of each calendar date (IST, UTC+5:30).
+    // This gives clean end-of-day prices and keeps total snapshots tiny.
     const startCol = isNewFormat ? 1 : 0;
-    const colLimit = Math.max(startCol, header.length - MAX_SNAPSHOTS);
-    const meta = [];
-    for (let c = colLimit; c < header.length; c++) {
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // IST = UTC+5:30
+
+    // 1. Scan ALL columns (no pre-limit), group by IST date, keep latest per date
+    const dayLatest = {}; // "YYYY-MM-DD" → {col, label, ts}
+    for (let c = startCol; c < header.length; c++) {
       const colTs = parseTimestamp(header[c]);
-      if (colTs) meta.push({ col: c, label: clean(header[c]), ts: colTs });
+      if (!colTs) continue;
+      // Convert to IST to get the correct calendar date
+      const istDate = new Date(colTs + IST_OFFSET_MS);
+      const dateKey = istDate.toISOString().slice(0, 10); // YYYY-MM-DD
+      if (!dayLatest[dateKey] || colTs > dayLatest[dateKey].ts) {
+        dayLatest[dateKey] = { col: c, label: clean(header[c]), ts: colTs };
+      }
     }
 
+    // 2. Sort by date ascending, keep last MAX_SNAPSHOTS days
+    const meta = Object.values(dayLatest)
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-MAX_SNAPSHOTS);
+
     if (meta.length === 0) throw new Error("No timestamp columns found in NSE sheet header");
-    console.log(`[Sync] Found ${meta.length} timestamp columns, ${s2Rows.length - 1} symbol rows`);
+    console.log(`[Sync] Columns in sheet: ${header.length - startCol}, unique days: ${Object.keys(dayLatest).length}, using: ${meta.length} end-of-day columns, ${s2Rows.length - 1} symbol rows`);
 
     // Build price map: ts_col → { SYM: price }
     const priceMap = {};
@@ -491,15 +507,18 @@ module.exports = async (req, res) => {
 
     pool.snapshots = [...(pool.snapshots || []), ...toAdd];
 
-    // Deduplicate by id
-    const seenIds = new Set();
-    pool.snapshots = pool.snapshots.filter(s => {
-      if (seenIds.has(s.id)) return false;
-      seenIds.add(s.id);
-      return true;
-    }).sort((a, b) => a.ts - b.ts);
+    // Deduplicate by IST calendar date: keep only the LATEST snapshot per date.
+    // This handles re-syncs where the same day might appear with a different
+    // column index (and thus a different id) after a sheet rollup.
+    const dateBest = {}; // "YYYY-MM-DD" → snapshot
+    for (const s of pool.snapshots) {
+      const istDate = new Date(s.ts + IST_OFFSET_MS);
+      const dk = istDate.toISOString().slice(0, 10);
+      if (!dateBest[dk] || s.ts > dateBest[dk].ts) dateBest[dk] = s;
+    }
+    pool.snapshots = Object.values(dateBest).sort((a, b) => a.ts - b.ts);
 
-    // Rolling window: track which snap ids get evicted
+    // Rolling window: evict oldest dates beyond MAX_SNAPSHOTS
     let removedIds = [];
     if (pool.snapshots.length > MAX_SNAPSHOTS) {
       const removed = pool.snapshots.splice(0, pool.snapshots.length - MAX_SNAPSHOTS);
@@ -513,7 +532,8 @@ module.exports = async (req, res) => {
     pool.lastSync = Date.now();
     pool.syncCount = (pool.syncCount || 0) + 1;
 
-    console.log(`[Sync] Pool: ${pool.snapshots.length} snaps, ${pool.symbols.length} syms, +${toAdd.length} added, -${removedIds.length} evicted`);
+    console.log(`[Sync] Pool: ${pool.snapshots.length} daily snaps, ${pool.symbols.length} syms, +${toAdd.length} added, -${removedIds.length} evicted`);
+
 
     // ── Save ──────────────────────────────────────────────────────────────────
     let kvSaved = false;

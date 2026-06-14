@@ -1670,35 +1670,53 @@ function fetchFromGoogleSheetsRealtime() {
           (rows.length > 0 && rows[0].c?.[0]?.v && typeof rows[0].c[0].v === 'string' && isNaN(parseFloat(rows[0].c[0].v)));
 
         const startCol = firstColIsSymbol ? 1 : 0;
-        const MAX_SNAPS = 200;
+        const MAX_SNAPS = 365; // days of history
 
-        // Build meta: timestamp + col index for each price column
-        const meta = [];
-        const colStart = Math.max(startCol, cols.length - MAX_SNAPS);
-        for (let c = colStart; c < cols.length; c++) {
+        // ── "Last snapshot per calendar day" ──────────────────────────────────
+        // Scan ALL timestamp columns, group by IST date (UTC+5:30),
+        // keep only the LAST (latest) column per date = end-of-day price.
+        const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+        const dayLatest = {}; // "YYYY-MM-DD" → {col, label, ts}
+        for (let c = startCol; c < cols.length; c++) {
           const col = cols[c];
           const ts = gvizColTimestamp(col);
-          if (ts) {
-            meta.push({ col: c, label: gvizColLabel(col) || `Col${c}`, ts });
+          if (!ts) continue;
+          const istDate = new Date(ts + IST_OFFSET_MS);
+          const dateKey = istDate.toISOString().slice(0, 10);
+          if (!dayLatest[dateKey] || ts > dayLatest[dateKey].ts) {
+            dayLatest[dateKey] = { col: c, label: gvizColLabel(col) || col.label || '', ts };
           }
         }
 
-        // Fallback: if no timestamps found in cols (e.g., gviz didn't populate col.v or col.label),
-        // try reading the header from the first row (some sheet configurations put header in row 0)
+        // Sort ascending, take last MAX_SNAPS days
+        const meta = Object.values(dayLatest)
+          .sort((a, b) => a.ts - b.ts)
+          .slice(-MAX_SNAPS);
+
+
+        // Fallback: if no timestamps found in cols, try row[0] as header
         let dataStartRow = 0;
         if (meta.length === 0 && rows.length > 0) {
           console.warn('[MarketAI] No timestamps in cols — trying row[0] as header fallback...');
           const headerRow = rows[0]?.c || [];
-          const hColStart = Math.max(startCol, headerRow.length - MAX_SNAPS);
-          for (let c = hColStart; c < headerRow.length; c++) {
+          const fbDayLatest = {};
+          for (let c = startCol; c < headerRow.length; c++) {
             const cell = headerRow[c];
             const raw = cell?.f || cell?.v;
             if (!raw) continue;
             const ts = parseSheetTimestamp(String(raw));
-            if (ts) meta.push({ col: c, label: String(cell?.f || cell?.v || ''), ts });
+            if (!ts) continue;
+            const istDate = new Date(ts + IST_OFFSET_MS);
+            const dk = istDate.toISOString().slice(0, 10);
+            if (!fbDayLatest[dk] || ts > fbDayLatest[dk].ts) {
+              fbDayLatest[dk] = { col: c, label: String(cell?.f || cell?.v || ''), ts };
+            }
           }
+          const fbMeta = Object.values(fbDayLatest).sort((a, b) => a.ts - b.ts).slice(-MAX_SNAPS);
+          fbMeta.forEach(m => meta.push(m));
           if (meta.length > 0) dataStartRow = 1; // skip header row
         }
+
 
         if (meta.length === 0) {
           throw new Error("NSE sheet: no timestamp columns found — make sure the sheet has price columns with date headers (format: dd/MM/yyyy HH:mm)");
