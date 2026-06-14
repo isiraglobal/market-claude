@@ -1513,6 +1513,7 @@ function parseSheetTimestamp(raw) {
     if (ts >= 946684800000 && ts <= 4102444800000) return ts;
     return null;
   }
+  // gviz Date() format: Date(year, month_0indexed, day, h, m, s)
   const gviz = s.match(/^Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)$/i);
   if (gviz) {
     const [, yr, mo, day, hh = 0, mm = 0, ss = 0] = gviz;
@@ -1521,12 +1522,13 @@ function parseSheetTimestamp(raw) {
     const ts = new Date(yr_num, +mo, +day, +hh, +mm, +ss).getTime();
     return isNaN(ts) ? null : ts;
   }
+  // dd/MM/yyyy HH:mm[:ss] format (used by Google Apps Script)
   const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
   if (dmy) {
     const [, day, mon, yr, hh, mm, ss = "00"] = dmy;
     const yr_num = +yr;
     if (yr_num < 2000 || yr_num > 2100) return null;
-    const ts = new Date(`${yr}-${mon.padStart(2, "0")}-${day.padStart(2, "0")}T${hh.padStart(2, "0")}:${mm.padStart(2, "0")}:${ss.padStart(2, "0")}`).getTime();
+    const ts = new Date(`${yr}-${mon.padStart(2,"0")}-${day.padStart(2,"0")}T${hh.padStart(2,"0")}:${mm.padStart(2,"0")}:${ss.padStart(2,"0")}`).getTime();
     return isNaN(ts) ? null : ts;
   }
   const d = new Date(s);
@@ -1536,145 +1538,235 @@ function parseSheetTimestamp(raw) {
 }
 
 function parseSheetPrice(raw) {
-  if (!raw) return null;
+  if (raw === null || raw === undefined) return null;
+  // If it's already a number (from gviz .v field), validate and return
+  if (typeof raw === 'number') return isFinite(raw) && raw > 0 ? raw : null;
   let s = cleanStr(raw);
-  if (!s || ["#N/A", "N/A", "#VALUE!", "#REF!", "#ERROR!", "#NUM!"].includes(s)) return null;
+  if (!s || ["#N/A", "N/A", "#VALUE!", "#REF!", "#ERROR!", "#NUM!", "Loading...", ""].includes(s)) return null;
   let n = parseFloat(s);
   if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
   return isFinite(n) && n > 0 ? n : null;
 }
 
+// ── Google Sheets Direct Fetch (JSONP via gviz) ───────────────────────────────
+// This is the browser-side fallback when the Vercel API sync fails.
+// Uses the Google Visualization API (JSONP) to fetch data directly from the sheet.
 function fetchFromGoogleSheetsRealtime() {
   return new Promise((resolve, reject) => {
     const sheetId = '1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA';
-    
-    function fetchJSONP(sheetName) {
+
+    function fetchJSONP(sheetName, timeoutMs = 20000) {
       return new Promise((res, rej) => {
-        const callbackName = 'googleSheetCallback_' + Math.round(Math.random() * 1000000);
+        let settled = false;
+        const callbackName = 'gsc_' + sheetName.replace(/\W/g,'') + '_' + Math.round(Math.random() * 10000000);
         const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=responseHandler:${callbackName}&sheet=${encodeURIComponent(sheetName)}&t=${Date.now()}`;
-        
-        const script = document.createElement('script');
-        script.src = url;
-        script.id = callbackName;
-        
+
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          rej(new Error(`Timeout loading sheet "${sheetName}" after ${timeoutMs/1000}s`));
+        }, timeoutMs);
+
         window[callbackName] = function(data) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           cleanup();
           res(data);
         };
-        
-        script.onerror = function(err) {
+
+        const script = document.createElement('script');
+        script.src = url;
+        script.id = callbackName;
+        script.onerror = function() {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           cleanup();
-          rej(new Error(`Failed to load sheet ${sheetName} via JSONP`));
+          rej(new Error(`Network error loading sheet "${sheetName}"`));
         };
-        
+
         function cleanup() {
-          try { document.getElementById(callbackName)?.remove(); } catch(e) {}
+          try { const el = document.getElementById(callbackName); if (el) el.remove(); } catch(e) {}
           try { delete window[callbackName]; } catch(e) {}
         }
-        
+
         document.body.appendChild(script);
       });
     }
 
+    // Helper: extract timestamp from a gviz column descriptor
+    // gviz date columns store the Date object in col.v, and formatted string in col.label
+    function gvizColTimestamp(col) {
+      // Raw value might be a JS Date object from gviz deserialization
+      if (col.v instanceof Date) {
+        const ts = col.v.getTime();
+        if (!isNaN(ts) && ts > 946684800000 && ts < 4102444800000) return ts;
+      }
+      // Try formatted label (e.g. "14/06/2026 09:30")
+      if (col.label) {
+        const ts = parseSheetTimestamp(col.label);
+        if (ts) return ts;
+      }
+      // Try id field
+      if (col.id) {
+        const ts = parseSheetTimestamp(col.id);
+        if (ts) return ts;
+      }
+      return null;
+    }
+
+    function gvizColLabel(col) {
+      if (col.label && col.label.trim()) return col.label.trim();
+      if (col.v instanceof Date) {
+        try {
+          return col.v.toLocaleDateString('en-IN', {day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'});
+        } catch(e) { return col.v.toISOString().slice(0,16); }
+      }
+      if (col.id && col.id.trim()) return col.id.trim();
+      return '';
+    }
+
+    // Extract price from a gviz cell object
+    function gvizCellPrice(cell) {
+      if (!cell) return null;
+      // gviz gives us the raw numeric value in cell.v
+      if (typeof cell.v === 'number') return isFinite(cell.v) && cell.v > 0 ? cell.v : null;
+      // Fall back to the formatted string in cell.f
+      if (cell.f) return parseSheetPrice(cell.f);
+      return null;
+    }
+
     Promise.all([
       fetchJSONP('SYMBOLS').catch(err => {
-        console.warn('SYMBOLS sheet fetch failed, proceeding with NSE sheet only:', err);
+        console.warn('[MarketAI] SYMBOLS sheet fetch failed:', err.message);
         return null;
       }),
       fetchJSONP('NSE')
     ])
-      .then(([symbolsData, nseData]) => {
-        try {
-          // Extract symbols rows
-          const s1Rows = [];
-          if (symbolsData?.table?.rows) {
-            for (const r of symbolsData.table.rows) {
-              if (!r || !r.c) continue;
-              s1Rows.push(r.c.map(cell => cell ? (cell.v !== null && cell.v !== undefined ? String(cell.v) : '') : ''));
-            }
+    .then(([symbolsData, nseData]) => {
+      try {
+        if (!nseData || !nseData.table) throw new Error("NSE sheet returned no table data from Google");
+
+        const table = nseData.table;
+        const cols = table.cols || [];
+        const rows = table.rows || [];
+
+        if (rows.length < 1) throw new Error("NSE sheet has no rows");
+        if (cols.length < 2) throw new Error("NSE sheet has no timestamp columns");
+
+        // NSE sheet format (written by Google Apps Script):
+        //   Col 0: Symbol (string)
+        //   Col 1..N: Price at each timestamp (number, date header)
+        // gviz table.cols[0] = {label:"Symbol", type:"string"}
+        // gviz table.cols[1..N] = {label:"14/06/2026 09:30", type:"number", v: Date|null}
+        //
+        // IMPORTANT: gviz table.rows does NOT include the header row — rows are only data rows.
+
+        const firstColLabel = (cols[0]?.label || '').toUpperCase();
+        const firstColType  = (cols[0]?.type  || '').toLowerCase();
+        const firstColIsSymbol = firstColLabel.includes('SYMBOL') || firstColType === 'string' ||
+          (rows.length > 0 && rows[0].c?.[0]?.v && typeof rows[0].c[0].v === 'string' && isNaN(parseFloat(rows[0].c[0].v)));
+
+        const startCol = firstColIsSymbol ? 1 : 0;
+        const MAX_SNAPS = 200;
+
+        // Build meta: timestamp + col index for each price column
+        const meta = [];
+        const colStart = Math.max(startCol, cols.length - MAX_SNAPS);
+        for (let c = colStart; c < cols.length; c++) {
+          const col = cols[c];
+          const ts = gvizColTimestamp(col);
+          if (ts) {
+            meta.push({ col: c, label: gvizColLabel(col) || `Col${c}`, ts });
           }
-
-          // Extract NSE rows
-          const s2Rows = [];
-          if (nseData?.table?.rows) {
-            for (const r of nseData.table.rows) {
-              if (!r || !r.c) continue;
-              s2Rows.push(r.c.map(cell => cell ? (cell.v !== null && cell.v !== undefined ? String(cell.v) : '') : ''));
-            }
-          }
-
-          if (s2Rows.length < 2) throw new Error("No snapshots parsed from direct NSE fetch");
-
-          let header = [];
-          let headerFromCols = false;
-          if (nseData.table.cols && nseData.table.cols.length > 0) {
-            header = nseData.table.cols.map(c => c.label || '');
-            headerFromCols = true;
-          }
-          if (header.length === 0 || (!String(header[0] || '').toUpperCase().includes('SYMBOL') && s2Rows.length > 0)) {
-            header = s2Rows[0] || [];
-            headerFromCols = false;
-          }
-
-          const firstColHeader = String(header[0] || '').trim().toUpperCase();
-          const isNewFormat = firstColHeader.includes("SYMBOL") || isNaN(Number(s2Rows[0]?.[0] || ''));
-          const startCol = isNewFormat ? 1 : 0;
-
-          const meta = [];
-          const MAX_SNAPSHOTS = 200;
-          const colLimit = Math.max(startCol, header.length - MAX_SNAPSHOTS);
-          for (let c = colLimit; c < header.length; c++) {
-            const colTs = parseSheetTimestamp(header[c]);
-            if (colTs) meta.push({ col: c, label: String(header[c] || '').trim(), ts: colTs });
-          }
-
-          const priceMap = {};
-          meta.forEach(m => { priceMap[m.ts + "_" + m.col] = {}; });
-          const symsSet = new Set();
-
-          const startRow = headerFromCols ? 0 : 1;
-          for (let r = startRow; r < s2Rows.length; r++) {
-            const row = s2Rows[r];
-            if (!row || row.length === 0) continue;
-            
-            let sym = cleanStr(row[0]).toUpperCase().replace(/\s+/g, "");
-            if (!sym || sym === "SYMBOL" || sym.includes("SYMBOL-NSE") || sym.includes("SYMBOL–NSE")) continue;
-
-            for (const m of meta) {
-              const p = parseSheetPrice(row[m.col]);
-              if (p !== null) {
-                priceMap[m.ts + "_" + m.col][sym] = p;
-                symsSet.add(sym);
-              }
-            }
-          }
-
-          const validAdded = meta
-            .map(m => ({
-              id: `snap_${m.ts}_${m.col}`,
-              ts: m.ts,
-              label: m.label,
-              prices: priceMap[m.ts + "_" + m.col]
-            }))
-            .filter(s => Object.keys(s.prices).length > 0)
-            .sort((a, b) => a.ts - b.ts);
-
-          resolve({
-            snapshots: validAdded,
-            symbols: [...symsSet].sort(),
-            lastSync: Date.now(),
-            syncCount: 1,
-            portfolio: S.portfolio || [],
-            watchlists: S.watchlists || [],
-            watchlistItems: S.watchlistItems || [],
-            alerts: S.alerts || [],
-            screeners: S.screeners || []
-          });
-        } catch (e) {
-          reject(e);
         }
-      })
-      .catch(reject);
+
+        // Fallback: if no timestamps found in cols (e.g., gviz didn't populate col.v or col.label),
+        // try reading the header from the first row (some sheet configurations put header in row 0)
+        let dataStartRow = 0;
+        if (meta.length === 0 && rows.length > 0) {
+          console.warn('[MarketAI] No timestamps in cols — trying row[0] as header fallback...');
+          const headerRow = rows[0]?.c || [];
+          const hColStart = Math.max(startCol, headerRow.length - MAX_SNAPS);
+          for (let c = hColStart; c < headerRow.length; c++) {
+            const cell = headerRow[c];
+            const raw = cell?.f || cell?.v;
+            if (!raw) continue;
+            const ts = parseSheetTimestamp(String(raw));
+            if (ts) meta.push({ col: c, label: String(cell?.f || cell?.v || ''), ts });
+          }
+          if (meta.length > 0) dataStartRow = 1; // skip header row
+        }
+
+        if (meta.length === 0) {
+          throw new Error("NSE sheet: no timestamp columns found — make sure the sheet has price columns with date headers (format: dd/MM/yyyy HH:mm)");
+        }
+
+        const priceMap = {};
+        meta.forEach(m => { priceMap[m.ts + '_' + m.col] = {}; });
+        const symsSet = new Set();
+
+        // Process all data rows
+        for (let r = dataStartRow; r < rows.length; r++) {
+          const row = rows[r];
+          if (!row || !row.c || row.c.length === 0) continue;
+
+          // Get symbol from column 0
+          const symCell = row.c[0];
+          const rawSym = cleanStr(symCell?.v || symCell?.f || '').toUpperCase().replace(/\s+/g, '');
+
+          // Skip empty, header-like, or error rows
+          if (!rawSym || rawSym === 'SYMBOL' || rawSym.startsWith('SYMBOL') ||
+              rawSym === '#N/A' || rawSym === '#ERROR!' || rawSym === '#VALUE!') continue;
+
+          for (const m of meta) {
+            const cell = row.c[m.col];
+            const p = gvizCellPrice(cell);
+            if (p !== null) {
+              priceMap[m.ts + '_' + m.col][rawSym] = p;
+              symsSet.add(rawSym);
+            }
+          }
+        }
+
+        const validSnaps = meta
+          .map(m => ({
+            id: `snap_${m.ts}_${m.col}`,
+            ts: m.ts,
+            label: m.label,
+            prices: priceMap[m.ts + '_' + m.col]
+          }))
+          .filter(s => Object.keys(s.prices).length > 0)
+          .sort((a, b) => a.ts - b.ts);
+
+        if (validSnaps.length === 0) {
+          throw new Error("NSE sheet parsed successfully but no valid price data found — verify sheet has symbols in col A and prices in col B onwards");
+        }
+
+        console.log(`[MarketAI] Direct sheet fetch: ${validSnaps.length} snapshots, ${symsSet.size} symbols`);
+
+        resolve({
+          snapshots: validSnaps,
+          symbols: [...symsSet].sort(),
+          lastSync: Date.now(),
+          syncCount: 1,
+          portfolio: S.portfolio || [],
+          watchlists: S.watchlists || [],
+          watchlistItems: S.watchlistItems || [],
+          alerts: S.alerts || [],
+          screeners: S.screeners || []
+        });
+      } catch (e) {
+        console.error('[MarketAI] fetchFromGoogleSheetsRealtime error:', e.message);
+        reject(e);
+      }
+    })
+    .catch(err => {
+      console.error('[MarketAI] JSONP fetch failed:', err.message);
+      reject(err);
+    });
   });
 }
 

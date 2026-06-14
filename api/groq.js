@@ -4,7 +4,10 @@
 const https = require("https");
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const DEFAULT_MODEL = "mixtral-8x7b-32768";
+// llama-3.3-70b-versatile is Groq's current recommended fast model
+// mixtral-8x7b-32768 was deprecated and removed by Groq
+const DEFAULT_MODEL = "llama-3.3-70b-versatile";
+const FALLBACK_MODEL = "llama3-70b-8192";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -57,55 +60,66 @@ module.exports = async (req, res) => {
       return;
     }
 
-    // Build payload for Groq
-    const payload = {
-      model: DEFAULT_MODEL,
-      messages: messages,
-      max_tokens: maxTokens,
-      temperature: 0.2
-    };
-
-    // Forward to Groq
-    const groqResponse = await new Promise((resolve, reject) => {
-      const options = {
-        hostname: "api.groq.com",
-        port: 443,
-        path: "/openai/v1/chat/completions",
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${GROQ_API_KEY}`,
-          "Content-Type": "application/json"
-        }
+    // Helper to call Groq with a specific model
+    async function callGroq(model) {
+      const payload = {
+        model,
+        messages,
+        max_tokens: maxTokens,
+        temperature: 0.2
       };
-
-      const groqReq = https.request(options, (groqRes) => {
-        let responseBody = "";
-        groqRes.on("data", (chunk) => responseBody += chunk);
-        groqRes.on("end", () => {
-          try {
-            resolve({ status: groqRes.statusCode, body: JSON.parse(responseBody) });
-          } catch(e) {
-            resolve({ status: groqRes.statusCode, error: "Invalid JSON from Groq API", raw: responseBody });
+      return new Promise((resolve, reject) => {
+        const options = {
+          hostname: "api.groq.com",
+          port: 443,
+          path: "/openai/v1/chat/completions",
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json"
           }
+        };
+        const groqReq = https.request(options, (groqRes) => {
+          let responseBody = "";
+          groqRes.on("data", (chunk) => responseBody += chunk);
+          groqRes.on("end", () => {
+            try {
+              resolve({ status: groqRes.statusCode, body: JSON.parse(responseBody) });
+            } catch(e) {
+              resolve({ status: groqRes.statusCode, error: "Invalid JSON from Groq API", raw: responseBody });
+            }
+          });
         });
+        groqReq.on("error", reject);
+        groqReq.write(JSON.stringify(payload));
+        groqReq.end();
       });
+    }
 
-      groqReq.on("error", reject);
-      groqReq.write(JSON.stringify(payload));
-      groqReq.end();
-    });
+    // Try primary model, fallback to secondary if not found / deprecated
+    let groqResponse = await callGroq(DEFAULT_MODEL);
+
+    // If model not found (404) or model error, try fallback
+    if (groqResponse.status !== 200) {
+      const errMsg = groqResponse.body?.error?.message || "";
+      const isModelErr = groqResponse.status === 404 || errMsg.toLowerCase().includes("model") || errMsg.toLowerCase().includes("not found") || errMsg.toLowerCase().includes("deprecated");
+      if (isModelErr && FALLBACK_MODEL && FALLBACK_MODEL !== DEFAULT_MODEL) {
+        console.warn(`[Groq] Primary model "${DEFAULT_MODEL}" unavailable (${groqResponse.status}), trying fallback "${FALLBACK_MODEL}"`);
+        groqResponse = await callGroq(FALLBACK_MODEL);
+      }
+    }
 
     if (groqResponse.status !== 200) {
       res.writeHead(groqResponse.status, CORS_HEADERS);
       res.end(JSON.stringify({
         ok: false,
-        error: groqResponse.body?.error?.message || groqResponse.error || "Groq API error"
+        error: groqResponse.body?.error?.message || groqResponse.error || `Groq API returned HTTP ${groqResponse.status}`
       }));
       return;
     }
 
     const aiText = groqResponse.body?.choices?.[0]?.message?.content || "";
-    
+
     res.writeHead(200, CORS_HEADERS);
     res.end(JSON.stringify({
       ok: true,
