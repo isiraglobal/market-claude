@@ -33,14 +33,21 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Read request body
-    let bodyData = "";
-    await new Promise((resolve) => {
-      req.on("data", (chunk) => bodyData += chunk);
-      req.on("end", resolve);
-    });
+    let parsedBody = req.body;
+    if (!parsedBody) {
+      // Read request body stream manually (fallback)
+      let bodyData = "";
+      await new Promise((resolve) => {
+        req.on("data", (chunk) => bodyData += chunk);
+        req.on("end", resolve);
+      });
+      try {
+        parsedBody = JSON.parse(bodyData || "{}");
+      } catch (e) {
+        parsedBody = {};
+      }
+    }
 
-    const parsedBody = JSON.parse(bodyData || "{}");
     const messages = parsedBody.messages || [];
     const maxTokens = parsedBody.max_tokens || 400;
 

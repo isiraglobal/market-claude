@@ -12,9 +12,12 @@ const USER_FILE = path.join(__dirname, "../userdata.json");
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-// Global in-memory cache for fallback when no persistence is available
-let memoryMarketData = null;
-let memoryUserData = null;
+// Global in-memory cache with modification-time invalidation
+let cachedMarketData = null;
+let cachedMarketMtime = 0;
+
+let cachedUserData = null;
+let cachedUserMtime = 0;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -117,22 +120,51 @@ module.exports = async (req, res) => {
     let user = null;
 
     if (KV_URL && KV_TOKEN) {
-      // 1. Try fetching from Vercel KV
-      market = await kvGet("market-data");
-      user = await kvGet("user-data");
+      // 1. Try fetching from Vercel KV in parallel for faster serverless load speeds
+      const [mRes, uRes] = await Promise.all([
+        kvGet("market-data"),
+        kvGet("user-data")
+      ]);
+      market = mRes;
+      user = uRes;
     }
 
-    // 2. Fallback to local files (works in dev or writable production environments)
+    // 2. Fallback to local files with in-memory caching and mtime invalidation
     if (!market) {
-      market = readLocalJSON(DATA_FILE, { snapshots: [], symbols: [], lastSync: null });
-    }
-    if (!user) {
-      user = readLocalJSON(USER_FILE, { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] });
+      try {
+        if (fs.existsSync(DATA_FILE)) {
+          const stat = fs.statSync(DATA_FILE);
+          if (stat.mtimeMs !== cachedMarketMtime || !cachedMarketData) {
+            cachedMarketData = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+            cachedMarketMtime = stat.mtimeMs;
+          }
+          market = cachedMarketData;
+        }
+      } catch (e) {
+        console.error("Error reading market cache:", e);
+      }
+      if (!market) {
+        market = { snapshots: [], symbols: [], lastSync: null };
+      }
     }
 
-    // 3. Fallback to in-memory store
-    if (!market && memoryMarketData) market = memoryMarketData;
-    if (!user && memoryUserData) user = memoryUserData;
+    if (!user) {
+      try {
+        if (fs.existsSync(USER_FILE)) {
+          const stat = fs.statSync(USER_FILE);
+          if (stat.mtimeMs !== cachedUserMtime || !cachedUserData) {
+            cachedUserData = JSON.parse(fs.readFileSync(USER_FILE, "utf8"));
+            cachedUserMtime = stat.mtimeMs;
+          }
+          user = cachedUserData;
+        }
+      } catch (e) {
+        console.error("Error reading user cache:", e);
+      }
+      if (!user) {
+        user = { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] };
+      }
+    }
 
     res.writeHead(200, CORS_HEADERS);
     res.end(JSON.stringify({
@@ -163,8 +195,8 @@ module.exports = async (req, res) => {
       if (!user) {
         user = readLocalJSON(USER_FILE, { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] });
       }
-      if (!user && memoryUserData) {
-        user = memoryUserData;
+      if (!user && cachedUserData) {
+        user = cachedUserData;
       }
       if (!user) {
         user = { portfolio: [], watchlists: [], watchlistItems: [], alerts: [], screeners: [] };
@@ -194,8 +226,13 @@ module.exports = async (req, res) => {
       // Always write to local file as secondary/development save
       const localSaved = writeLocalJSON(USER_FILE, user);
       
-      // Update memory store
-      memoryUserData = user;
+      // Update cache and mtime
+      if (localSaved) {
+        try {
+          cachedUserData = user;
+          cachedUserMtime = fs.statSync(USER_FILE).mtimeMs;
+        } catch (e) {}
+      }
 
       res.writeHead(200, CORS_HEADERS);
       res.end(JSON.stringify({ ok: true, saved: saved || localSaved }));

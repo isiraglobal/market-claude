@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 
-const SHEET_ID = "10Wha7-e2_51oaK8MaJfvC6RacmHptXuKvtHMQBIvVXY";
+const SHEET_ID = "1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA";
 const DATA_FILE = path.join(__dirname, "../data.json");
 
 const KV_URL = process.env.KV_REST_API_URL;
@@ -24,10 +24,30 @@ const CORS_HEADERS = {
 function fetchURL(url) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { "User-Agent": "MarketAI-Sync/1.0" } }, (res) => {
+      if (res.statusCode !== 200) {
+        try {
+          const { execSync } = require("child_process");
+          const body = execSync(`curl -s -L "${url}"`, { encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
+          resolve({ status: 200, body });
+        } catch (curlErr) {
+          console.error("[fetchURL curl error for non-200 fallback]:", curlErr.message);
+          resolve({ status: res.statusCode, body: "" });
+        }
+        return;
+      }
       let body = "";
       res.on("data", (chunk) => body += chunk);
-      res.on("end", () => resolve({ status: res.statusCode, body }));
-    }).on("error", reject);
+      res.on("end", () => resolve({ status: 200, body }));
+    }).on("error", (err) => {
+      try {
+        const { execSync } = require("child_process");
+        const body = execSync(`curl -s -L "${url}"`, { encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
+        resolve({ status: 200, body });
+      } catch (curlErr) {
+        console.error("[fetchURL curl error on connection error]:", curlErr.message);
+        reject(err);
+      }
+    });
   });
 }
 
@@ -246,29 +266,37 @@ module.exports = async (req, res) => {
 
   try {
     const ts = Date.now();
-    // 1. Fetch SYMBOLS (Current Prices)
-    const s1Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=SYMBOLS&t=${ts}`;
-    const s1Resp = await fetchURL(s1Url);
-    if (s1Resp.status !== 200) throw new Error(`SYMBOLS sheet returned HTTP ${s1Resp.status}`);
-    const s1Rows = parseCSV(s1Resp.body);
+    let csvSymbols = req.body && req.body.csvSymbols;
+    let csvNse = req.body && req.body.csvNse;
 
-    // 2. Fetch NSE (Price History)
-    const s2Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=NSE&t=${ts}`;
-    const s2Resp = await fetchURL(s2Url);
-    if (s2Resp.status !== 200) throw new Error(`NSE sheet returned HTTP ${s2Resp.status}`);
-    const s2Rows = parseCSV(s2Resp.body);
+    if (!csvSymbols || !csvNse) {
+      // 1. Fetch SYMBOLS (Current Prices)
+      const s1Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=SYMBOLS&t=${ts}`;
+      const s1Resp = await fetchURL(s1Url);
+      if (s1Resp.status !== 200) throw new Error(`SYMBOLS sheet returned HTTP ${s1Resp.status}`);
+      csvSymbols = s1Resp.body;
 
-    if (s2Rows.length < 2) throw new Error("No snapshots parsed from Sheet2");
+      // 2. Fetch NSE (Price History)
+      const s2Url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=NSE&t=${ts}`;
+      const s2Resp = await fetchURL(s2Url);
+      if (s2Resp.status !== 200) throw new Error(`NSE sheet returned HTTP ${s2Resp.status}`);
+      csvNse = s2Resp.body;
+    }
+
+    const s1Rows = parseCSV(csvSymbols);
+    const s2Rows = parseCSV(csvNse);
+
+    if (s2Rows.length < 2) throw new Error("No snapshots parsed from NSE sheet");
 
     const header = s2Rows[0];
     const firstColHeader = clean(header[0]).toUpperCase();
     
     // Check if new format (first column is symbol name)
-    const isNewFormat = firstColHeader === "SYMBOL" || isNaN(parseFloat(s2Rows[1][0]));
+    const isNewFormat = firstColHeader.includes("SYMBOL") || isNaN(Number(s2Rows[1][0].trim()));
     
     let mapping = {};
     if (!isNewFormat) {
-      // Run DP sequence alignment to map sheet2 rows to sheet1 symbols
+      // Run DP sequence alignment to map NSE rows to SYMBOLS
       mapping = alignRows(s1Rows, s2Rows);
     }
 

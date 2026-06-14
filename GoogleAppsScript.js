@@ -9,13 +9,7 @@ const CONFIG = {
   KEEP_DAYS: 7,
 
   MARKETS: [
-    { name: 'NSE', sheet: 'NSE', symbolCol: 1, priceCol: 2 },
-    { name: 'NASDAQ', sheet: 'NASDAQ', symbolCol: 3, priceCol: 4 },
-    { name: 'LSE', sheet: 'LSE', symbolCol: 5, priceCol: 6 },
-    { name: 'SGX', sheet: 'SGX', symbolCol: 7, priceCol: 8 },
-    { name: 'HKEX', sheet: 'HKEX', symbolCol: 9, priceCol: 10 },
-    { name: 'JPX', sheet: 'JPX', symbolCol: 11, priceCol: 12 },
-    { name: 'ASX', sheet: 'ASX', symbolCol: 13, priceCol: 14 },
+    { name: 'NSE', sheet: 'NSE', symbolCol: 1, priceCol: 2 }
   ],
 };
 
@@ -38,7 +32,7 @@ function logStockPrices() {
     return;
   }
 
-  const allData = symbolsSheet.getRange(1, 1, lastRow, 14).getValues();
+  const allData = symbolsSheet.getRange(1, 1, lastRow, 2).getValues();
 
   for (const market of CONFIG.MARKETS) {
     try {
@@ -59,6 +53,9 @@ function processMarket(ss, market, allData, now) {
     console.warn(`[MarketAI] Tab "${market.sheet}" is missing. Run Create Market Sheets.`);
     return;
   }
+
+  // Clean up old snapshots and empty columns to avoid 10M cell limit
+  cleanupSheetData(marketSheet, CONFIG.KEEP_DAYS);
 
   const { symbols, prices } = extractMarketData(allData, market);
   if (symbols.length === 0) return;
@@ -210,28 +207,21 @@ function pricesUnchanged(marketSheet, newPrices) {
   return true;
 }
 
-// ─── 7 DAY CLEANUP ─────────────────────────────────────────────────────────────
-function cleanupOldData() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+// ─── 7 DAY CLEANUP & TRIMMING ──────────────────────────────────────────────────
+function cleanupSheetData(sheet, keepDays) {
   const now = getNowIST();
-
   const cutoff = new Date(now);
-  cutoff.setDate(cutoff.getDate() - CONFIG.KEEP_DAYS);
+  cutoff.setDate(cutoff.getDate() - keepDays);
   cutoff.setHours(0, 0, 0, 0);
 
-  CONFIG.MARKETS.forEach(market => {
-    const sheet = ss.getSheetByName(market.sheet);
-    if (!sheet) return;
-
-    const lastCol = sheet.getLastColumn();
-    if (lastCol < 2) return;
-
+  let lastCol = sheet.getLastColumn();
+  
+  if (lastCol >= 2) {
     const headers = sheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
     const colsToDelete = [];
 
     headers.forEach((header, idx) => {
       if (!header) return;
-
       const d = header instanceof Date ? header : new Date(header);
       if (isNaN(d.getTime())) return;
 
@@ -240,11 +230,26 @@ function cleanupOldData() {
       }
     });
 
+    // Delete old columns
     colsToDelete.sort((a, b) => b - a);
     colsToDelete.forEach(col => sheet.deleteColumn(col));
+  }
 
-    if (colsToDelete.length > 0) {
-      console.log(`[MarketAI] ${market.name}: Deleted ${colsToDelete.length} old columns`);
+  // Trim trailing empty columns to keep cell count minimal
+  lastCol = Math.max(1, sheet.getLastColumn());
+  const maxCols = sheet.getMaxColumns();
+  if (maxCols > lastCol) {
+    sheet.deleteColumns(lastCol + 1, maxCols - lastCol);
+  }
+}
+
+function cleanupOldData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  CONFIG.MARKETS.forEach(market => {
+    const sheet = ss.getSheetByName(market.sheet);
+    if (sheet) {
+      cleanupSheetData(sheet, CONFIG.KEEP_DAYS);
+      console.log(`[MarketAI] Completed old data cleanup for ${market.name}`);
     }
   });
 }
@@ -284,7 +289,7 @@ function setupTriggers() {
 
   ScriptApp.newTrigger('logStockPrices')
     .timeBased()
-    .everyMinutes(10)
+    .everyMinutes(15)
     .create();
 
   ScriptApp.newTrigger('cleanupOldData')
@@ -295,7 +300,7 @@ function setupTriggers() {
 
   SpreadsheetApp.getUi().alert(
     '✓ Triggers Set:\n' +
-    '- Data logging every 10 mins\n' +
+    '- Data logging every 15 mins\n' +
     '- Cleanup every midnight'
   );
 }
