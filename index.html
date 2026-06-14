@@ -1495,11 +1495,197 @@ function sbar(score){
   return`<div class="sbar"><div class="sbar-track"><div class="sbar-fill" style="width:${score}%;background:${col}"></div></div><span style="font-size:9px;color:${col};font-weight:700;width:22px">${score}</span></div>`;
 }
 
+// Helper functions for client-side parsing of Google Sheets data
+function cleanStr(v) {
+  if (!v) return "";
+  let s = String(v).trim();
+  if (s.startsWith('"') && s.endsWith('"')) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function parseSheetTimestamp(raw) {
+  const s = cleanStr(raw);
+  if (!s || s === "SYMBOL") return null;
+  if (/^\d{10,}$/.test(s)) {
+    const ts = +s;
+    if (ts >= 946684800000 && ts <= 4102444800000) return ts;
+    return null;
+  }
+  const gviz = s.match(/^Date\((\d+),(\d+),(\d+)(?:,(\d+),(\d+),(\d+))?\)$/i);
+  if (gviz) {
+    const [, yr, mo, day, hh = 0, mm = 0, ss = 0] = gviz;
+    const yr_num = +yr;
+    if (yr_num < 2000 || yr_num > 2100) return null;
+    const ts = new Date(yr_num, +mo, +day, +hh, +mm, +ss).getTime();
+    return isNaN(ts) ? null : ts;
+  }
+  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (dmy) {
+    const [, day, mon, yr, hh, mm, ss = "00"] = dmy;
+    const yr_num = +yr;
+    if (yr_num < 2000 || yr_num > 2100) return null;
+    const ts = new Date(`${yr}-${mon.padStart(2, "0")}-${day.padStart(2, "0")}T${hh.padStart(2, "0")}:${mm}:${ss}`).getTime();
+    return isNaN(ts) ? null : ts;
+  }
+  const d = new Date(s);
+  const ts = d.getTime();
+  if (!isNaN(ts) && ts >= 946684800000 && ts <= 4102444800000) return ts;
+  return null;
+}
+
+function parseSheetPrice(raw) {
+  if (!raw) return null;
+  let s = cleanStr(raw);
+  if (!s || ["#N/A", "N/A", "#VALUE!", "#REF!", "#ERROR!", "#NUM!"].includes(s)) return null;
+  let n = parseFloat(s);
+  if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
+  return isFinite(n) && n > 0 ? n : null;
+}
+
+function fetchFromGoogleSheetsRealtime() {
+  return new Promise((resolve, reject) => {
+    const sheetId = '1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA';
+    
+    function fetchJSONP(sheetName) {
+      return new Promise((res, rej) => {
+        const callbackName = 'googleSheetCallback_' + Math.round(Math.random() * 1000000);
+        const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=responseHandler:${callbackName}&sheet=${encodeURIComponent(sheetName)}&t=${Date.now()}`;
+        
+        const script = document.createElement('script');
+        script.src = url;
+        script.id = callbackName;
+        
+        window[callbackName] = function(data) {
+          cleanup();
+          res(data);
+        };
+        
+        script.onerror = function(err) {
+          cleanup();
+          rej(new Error(`Failed to load sheet ${sheetName} via JSONP`));
+        };
+        
+        function cleanup() {
+          try { document.getElementById(callbackName)?.remove(); } catch(e) {}
+          try { delete window[callbackName]; } catch(e) {}
+        }
+        
+        document.body.appendChild(script);
+      });
+    }
+
+    Promise.all([fetchJSONP('SYMBOLS'), fetchJSONP('NSE')])
+      .then(([symbolsData, nseData]) => {
+        try {
+          // Extract symbols rows
+          const s1Rows = [];
+          if (symbolsData?.table?.rows) {
+            for (const r of symbolsData.table.rows) {
+              if (!r || !r.c) continue;
+              s1Rows.push(r.c.map(cell => cell ? (cell.v !== null && cell.v !== undefined ? String(cell.v) : '') : ''));
+            }
+          }
+
+          // Extract NSE rows
+          const s2Rows = [];
+          if (nseData?.table?.rows) {
+            for (const r of nseData.table.rows) {
+              if (!r || !r.c) continue;
+              s2Rows.push(r.c.map(cell => cell ? (cell.v !== null && cell.v !== undefined ? String(cell.v) : '') : ''));
+            }
+          }
+
+          if (s2Rows.length < 2) throw new Error("No snapshots parsed from direct NSE fetch");
+
+          let header = [];
+          if (nseData.table.cols && nseData.table.cols.length > 0) {
+            header = nseData.table.cols.map(c => c.label || '');
+          }
+          if (header.length === 0 || (!header[0].toUpperCase().includes('SYMBOL') && s2Rows.length > 0)) {
+            header = s2Rows[0] || [];
+          }
+
+          const firstColHeader = (header[0] || '').trim().toUpperCase();
+          const isNewFormat = firstColHeader.includes("SYMBOL") || isNaN(Number(s2Rows[0]?.[0] || ''));
+          const startCol = isNewFormat ? 1 : 0;
+
+          const meta = [];
+          const MAX_SNAPSHOTS = 200;
+          const colLimit = Math.max(startCol, header.length - MAX_SNAPSHOTS);
+          for (let c = colLimit; c < header.length; c++) {
+            const colTs = parseSheetTimestamp(header[c]);
+            if (colTs) meta.push({ col: c, label: header[c].trim(), ts: colTs });
+          }
+
+          const priceMap = {};
+          meta.forEach(m => { priceMap[m.ts + "_" + m.col] = {}; });
+          const symsSet = new Set();
+
+          const startRow = (nseData.table.cols && nseData.table.cols.length > 0) ? 0 : 1;
+          for (let r = startRow; r < s2Rows.length; r++) {
+            const row = s2Rows[r];
+            if (!row || row.length === 0) continue;
+            
+            let sym = cleanStr(row[0]).toUpperCase().replace(/\s+/g, "");
+            if (!sym || sym === "SYMBOL" || sym.includes("SYMBOL-NSE") || sym.includes("SYMBOL–NSE")) continue;
+
+            for (const m of meta) {
+              const p = parseSheetPrice(row[m.col]);
+              if (p !== null) {
+                priceMap[m.ts + "_" + m.col][sym] = p;
+                symsSet.add(sym);
+              }
+            }
+          }
+
+          const validAdded = meta
+            .map(m => ({
+              id: `snap_${m.ts}_${m.col}`,
+              ts: m.ts,
+              label: m.label,
+              prices: priceMap[m.ts + "_" + m.col]
+            }))
+            .filter(s => Object.keys(s.prices).length > 0)
+            .sort((a, b) => a.ts - b.ts);
+
+          resolve({
+            snapshots: validAdded,
+            symbols: [...symsSet].sort(),
+            lastSync: Date.now(),
+            syncCount: 1,
+            portfolio: S.portfolio || [],
+            watchlists: S.watchlists || [],
+            watchlistItems: S.watchlistItems || [],
+            alerts: S.alerts || [],
+            screeners: S.screeners || []
+          });
+        } catch (e) {
+          reject(e);
+        }
+      })
+      .catch(reject);
+  });
+}
+
 // ── Data layer ───────────────────────────────────────────────────────────────
 async function fetchData(){
-  const r=await fetch(`${API}/api/data`);
-  if(!r.ok)throw new Error('Data fetch failed: '+r.status);
-  return r.json();
+  try {
+    const r=await fetch(`${API}/api/data`);
+    if(r.ok) return await r.json();
+  } catch (err) {
+    console.warn('API fetch failed, trying local storage cache...', err);
+  }
+  
+  try {
+    const cached = JSON.parse(localStorage.getItem('marketai_cache') || '{}');
+    if (cached.snapshots && cached.snapshots.length > 0) {
+      return cached;
+    }
+  } catch(e) {}
+  
+  return await fetchFromGoogleSheetsRealtime();
 }
 async function saveUserData(){
   // Update local cache
@@ -1525,17 +1711,29 @@ async function doSync(silent=false){
   setSyncState('spin','Syncing...');
   setLoad(30);
   try{
-    const ts=Date.now();
-    const r=await fetch(`${API}/api/sync`, { method: 'POST' });
-    const j=await r.json();
-    setLoad(70);
-    if(!j.ok)throw new Error(j.error||'Sync failed');
-    // reload data from pool
-    const d=await fetchData();
+    let d;
+    try {
+      const r=await fetch(`${API}/api/sync`, { method: 'POST' });
+      const j=await r.json();
+      setLoad(70);
+      if(!j.ok)throw new Error(j.error||'Sync failed');
+      d=await fetchData();
+    } catch (apiErr) {
+      console.warn('Server sync failed, falling back to direct browser sync from Google Sheets:', apiErr);
+      setLoad(50);
+      d = await fetchFromGoogleSheetsRealtime();
+      try {
+        localStorage.setItem('marketai_cache', JSON.stringify({
+          snapshots: d.snapshots.slice(-5),
+          symbols: d.symbols,
+          lastSync: d.lastSync
+        }));
+      } catch(e) {}
+    }
     mergeData(d);
     setLoad(100);
     setSyncState('ok',`Synced ${fago(S.lastSync)} · ${S.snapshots.length} snaps`);
-    if(!silent)toast(`Synced ${j.snapshotsAdded} new snapshots · ${S.symbols.length} symbols`,'ok');
+    if(!silent)toast(`Synced ${S.snapshots.length} snapshots · ${S.symbols.length} symbols`,'ok');
     renderAll();
   }catch(e){
     setSyncState('err','Sync failed');
