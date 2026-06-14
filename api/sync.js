@@ -259,10 +259,10 @@ function parseTimestamp(raw) {
     const ts = new Date(yr_num, +mo, +day, +hh, +mm, +ss).getTime();
     return isNaN(ts) ? null : ts;
   }
-  // dd/MM/yyyy HH:mm[:ss] (written by Google Apps Script)
-  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
+  // dd/MM/yyyy [HH:mm[:ss]] (written by Google Apps Script)
+  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
   if (dmy) {
-    const [, day, mon, yr, hh, mm, ss = "00"] = dmy;
+    const [, day, mon, yr, hh = "00", mm = "00", ss = "00"] = dmy;
     const yr_num = +yr;
     if (yr_num < 2000 || yr_num > 2100) return null;
     const ts = new Date(`${yr}-${mon.padStart(2,"0")}-${day.padStart(2,"0")}T${hh.padStart(2,"0")}:${mm.padStart(2,"0")}:${ss.padStart(2,"0")}`).getTime();
