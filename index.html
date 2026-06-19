@@ -1002,6 +1002,9 @@ html[data-theme="light"] #themeToggleIconLight { color: var(--accent) !important
         <button class="navlink nav-icon-btn" data-pg="patterns" title="Patterns">
           <svg class="nav-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 11.9 13 12.5 13 14h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z" fill="currentColor"/></svg>
         </button>
+        <button class="navlink nav-icon-btn" data-pg="demandzones" title="Demand Zones">
+          <svg class="nav-icon" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        </button>
         <button class="navlink nav-icon-btn" data-pg="screener" title="Screener">
           <svg class="nav-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z" fill="currentColor"/></svg>
         </button>
@@ -1080,6 +1083,13 @@ html[data-theme="light"] #themeToggleIconLight { color: var(--accent) !important
 // ── API base (works both locally via dev server and on Vercel) ─────────────
 const API = '';
 
+// Google Sheets source (must match api/sync.js SHEET_ID and tab names)
+const SHEET_CONFIG = {
+  id: '1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA',
+  symbolsTab: 'SYMBOLS',
+  nseTab: 'NSE',
+};
+
 // ── App State ────────────────────────────────────────────────────────────────
 const S = {
   snapshots:[], symbols:[], lastSync:null,
@@ -1106,6 +1116,7 @@ const Cache = {
   topLosers: [],
   autoPicks: [],
   hammers: [],
+  demandZones: [],
   summary: {}
 };
 
@@ -1119,17 +1130,30 @@ function precomputeCache() {
   Cache.topLosers = [];
   Cache.autoPicks = [];
   Cache.hammers = [];
+  Cache.demandZones = [];
   Cache.summary = { total: 0, advances: 0, declines: 0, unchanged: 0 };
 
-  // 1. Build symbol histories
+  // 1. Build symbol histories (supports both single close price and OHLC objects)
   for (let i = 0; i < S.snapshots.length; i++) {
     const snap = S.snapshots[i];
-    for (const [sym, price] of Object.entries(snap.prices)) {
-      if (typeof price === 'number' && isFinite(price) && price > 0) {
-        if (!Cache.histories[sym]) {
-          Cache.histories[sym] = [];
-        }
-        Cache.histories[sym].push({ ts: snap.ts, label: snap.label, price });
+    if (!snap || typeof snap.ts !== 'number' || !snap.prices) continue;
+    for (const [sym, raw] of Object.entries(snap.prices)) {
+      let price, ohlc;
+      if (typeof raw === 'number' && isFinite(raw) && raw > 0) {
+        price = raw;
+      } else if (raw && typeof raw === 'object' && typeof raw.c === 'number' && isFinite(raw.c) && raw.c > 0) {
+        price = raw.c;
+        ohlc = raw;
+      } else continue;
+      if (!Cache.histories[sym]) Cache.histories[sym] = [];
+      const hist = Cache.histories[sym];
+      const last = hist[hist.length - 1];
+      if (last && last.ts === snap.ts) {
+        last.label = snap.label;
+        last.price = price;
+        if (ohlc) last.ohlc = ohlc;
+      } else {
+        hist.push({ ts: snap.ts, label: snap.label, price, ...(ohlc ? { ohlc } : {}) });
       }
     }
   }
@@ -1244,7 +1268,7 @@ function precomputeCache() {
   for (const sym of S.symbols) {
     const history = Cache.histories[sym] || [];
     const len = history.length;
-    if (len < 20) continue;
+    if (len < 15) continue;
     
     const priceArr = new Float64Array(len);
     for (let i = 0; i < len; i++) {
@@ -1262,7 +1286,7 @@ function precomputeCache() {
     }
 
     for (let hammerIdx = 14; hammerIdx < len - 1; hammerIdx++) {
-      if (runningDownSum >= 13) {
+      if (runningDownSum >= 12) {
         const prevPrice = priceArr[hammerIdx-1];
         const hammerPrice = priceArr[hammerIdx];
         const nextPrice = priceArr[hammerIdx+1];
@@ -1308,6 +1332,135 @@ function precomputeCache() {
     }
   }
   Cache.hammers = hammersList.sort((a, b) => b.score - a.score);
+
+  // demandZones — Rally-Base(s)-Rally detection (supports OHLC and close-only)
+  const zones = [];
+  const MAX_BASES = 4;
+  // Close-only fallback threshold (used when no OHLC data available)
+  const BASE_PCT = 0.5;
+
+  for (const sym of S.symbols) {
+    const history = Cache.histories[sym] || [];
+    if (history.length < 5) continue;
+
+    // Build candles using OHLC data when available, close-only fallback otherwise
+    const candles = [];
+    for (let i = 0; i < history.length; i++) {
+      const cur = history[i];
+      const prev = i > 0 ? history[i-1] : null;
+
+      let o, c, h, l, hasOHLC = false;
+
+      if (cur.ohlc) {
+        o = cur.ohlc.o; c = cur.ohlc.c;
+        h = cur.ohlc.h; l = cur.ohlc.l;
+        hasOHLC = true;
+      } else if (prev) {
+        o = prev.price; c = cur.price;
+        h = Math.max(o, c); l = Math.min(o, c);
+      } else {
+        candles.push(null); continue;
+      }
+
+      if (!isFinite(o) || !isFinite(c) || !isFinite(h) || !isFinite(l) ||
+          o <= 0 || c <= 0 || h <= 0 || l <= 0) {
+        candles.push(null); continue;
+      }
+
+      const body = Math.abs(c - o);
+      const range = h - l || 0.001;
+      const bodyRatio = body / range;
+      const ret = (c - o) / o * 100;
+      const isGreen = c >= o;
+
+      candles.push({
+        o, c, h, l, body, range, bodyRatio, ret, isGreen, hasOHLC,
+        ts: cur.ts,
+        label: cur.label
+      });
+    }
+
+    const len = candles.length;
+    if (len < 5) continue;
+
+    // Scan from newest to oldest to find the latest R-B-R pattern
+    let found = false;
+    for (let i = len - 3; i >= 0 && !found; i--) {
+      const c1 = candles[i];
+      if (!c1) continue;
+
+      // Classify first candle as Rally
+      const c1IsRally = c1.hasOHLC ? (c1.isGreen && c1.bodyRatio >= 0.5) : (c1.isGreen);
+      if (!c1IsRally) continue;
+
+      // Count consecutive bases after i
+      let nb = 0;
+      for (let j = i + 1; j < Math.min(i + 1 + MAX_BASES, len); j++) {
+        const b = candles[j];
+        if (!b) { nb = 0; break; }
+        // Base = body <= 50% of range (OHLC) OR small return (close-only)
+        const isBase = b.hasOHLC ? (b.bodyRatio < 0.5) : (Math.abs(b.ret) <= BASE_PCT);
+        if (isBase) nb++;
+        else break;
+      }
+      if (nb === 0) continue;
+
+      const r2Idx = i + 1 + nb;
+      if (r2Idx >= len) continue;
+      const c2 = candles[r2Idx];
+      if (!c2) continue;
+
+      // Classify second candle as Rally (green with body >= 50%)
+      const c2IsRally = c2.hasOHLC ? (c2.isGreen && c2.bodyRatio >= 0.5) : (c2.isGreen);
+      if (!c2IsRally) continue;
+
+      // Second rally close must be above first rally close
+      if (c2.c <= c1.c) continue;
+
+      found = true;
+
+      // Compute proximal = top of highest base body (max of max(o,c) across bases)
+      let proximal = -Infinity;
+      // Compute distal = lowest low among bases (min of l across bases)
+      let distal = Infinity;
+      for (let k = i + 1; k < r2Idx; k++) {
+        const bc = candles[k];
+        if (!bc) continue;
+        const bodyTop = Math.max(bc.o, bc.c);
+        if (bodyTop > proximal) proximal = bodyTop;
+        if (bc.l < distal) distal = bc.l;
+      }
+
+      // Tested: any subsequent candle (after rally2) has low <= proximal
+      let tested = false;
+      for (let k = r2Idx + 1; k < len; k++) {
+        const cc = candles[k];
+        if (cc && cc.l <= proximal) { tested = true; break; }
+      }
+
+      // Not tested: LTP > proximal * 1.02
+      const ltp = Cache.latestPrice[sym];
+      const notTested = ltp !== null && ltp > proximal * 1.02;
+
+      zones.push({
+        sym,
+        ts: c2.ts,
+        label: c2.label,
+        proximal: +proximal.toFixed(2),
+        distal: +distal.toFixed(2),
+        rally1Close: +c1.c.toFixed(2),
+        rally2Close: +c2.c.toFixed(2),
+        numBases: nb,
+        tested,
+        notTested,
+        distPct: ltp !== null ? +((ltp - proximal) / proximal * 100).toFixed(2) : null
+      });
+    }
+  }
+  Cache.demandZones = zones.sort((a, b) => {
+    if (a.notTested !== b.notTested) return a.notTested ? -1 : 1;
+    return b.ts - a.ts;
+  });
 }
 
 // ── Core computations ────────────────────────────────────────────────────────
@@ -1374,6 +1527,9 @@ function calcRSI(prices,n=14){
 }
 function hammerSignals(){
   return Cache.hammers;
+}
+function demandZones(){
+  return Cache.demandZones;
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────────
@@ -1551,9 +1707,42 @@ function parseSheetPrice(raw) {
 // ── Google Sheets Direct Fetch (JSONP via gviz) ───────────────────────────────
 // This is the browser-side fallback when the Vercel API sync fails.
 // Uses the Google Visualization API (JSONP) to fetch data directly from the sheet.
+function dedupeSnapshotsByTs(snaps) {
+  const tsBest = {};
+  for (const s of snaps || []) {
+    if (!s || typeof s.ts !== 'number' || !s.prices || typeof s.prices !== 'object') continue;
+    if (!tsBest[s.ts] || String(s.id || '') > String(tsBest[s.ts].id || '')) {
+      tsBest[s.ts] = s;
+    }
+  }
+  return Object.values(tsBest).sort((a, b) => a.ts - b.ts);
+}
+
+function saveLocalCache() {
+  const base = {
+    symbols: S.symbols,
+    lastSync: S.lastSync,
+    portfolio: S.portfolio,
+    watchlists: S.watchlists,
+    watchlistItems: S.watchlistItems,
+    alerts: S.alerts,
+    screeners: S.screeners,
+  };
+  for (const n of [40, 25, 15, 5]) {
+    try {
+      localStorage.setItem('marketai_cache', JSON.stringify({
+        ...base,
+        snapshots: S.snapshots.slice(-n),
+      }));
+      return;
+    } catch (e) {}
+  }
+  console.warn('Failed to save to localStorage');
+}
+
 function fetchFromGoogleSheetsRealtime() {
   return new Promise((resolve, reject) => {
-    const sheetId = '1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA';
+    const sheetId = SHEET_CONFIG.id;
 
     function fetchJSONP(sheetName, timeoutMs = 20000) {
       return new Promise((res, rej) => {
@@ -1573,6 +1762,11 @@ function fetchFromGoogleSheetsRealtime() {
           settled = true;
           clearTimeout(timer);
           cleanup();
+          if (!data || data.status === 'error') {
+            const err = data?.errors?.[0];
+            rej(new Error(err?.detailed_message || err?.message || `Google Sheets query failed for "${sheetName}"`));
+            return;
+          }
           res(data);
         };
 
@@ -1599,10 +1793,16 @@ function fetchFromGoogleSheetsRealtime() {
     // Helper: extract timestamp from a gviz column descriptor
     // gviz date columns store the Date object in col.v, and formatted string in col.label
     function gvizColTimestamp(col) {
+      if (!col) return null;
       // Raw value might be a JS Date object from gviz deserialization
       if (col.v instanceof Date) {
         const ts = col.v.getTime();
         if (!isNaN(ts) && ts > 946684800000 && ts < 4102444800000) return ts;
+      }
+      // JSONP returns Date(...) as a string, not a Date instance
+      if (col.v != null && typeof col.v === 'string') {
+        const ts = parseSheetTimestamp(col.v);
+        if (ts) return ts;
       }
       // Try formatted label (e.g. "14/06/2026 09:30")
       if (col.label) {
@@ -1631,19 +1831,21 @@ function fetchFromGoogleSheetsRealtime() {
     // Extract price from a gviz cell object
     function gvizCellPrice(cell) {
       if (!cell) return null;
-      // gviz gives us the raw numeric value in cell.v
       if (typeof cell.v === 'number') return isFinite(cell.v) && cell.v > 0 ? cell.v : null;
-      // Fall back to the formatted string in cell.f
+      if (cell.v != null) {
+        const parsed = parseSheetPrice(cell.v);
+        if (parsed !== null) return parsed;
+      }
       if (cell.f) return parseSheetPrice(cell.f);
       return null;
     }
 
     Promise.all([
-      fetchJSONP('SYMBOLS').catch(err => {
+      fetchJSONP(SHEET_CONFIG.symbolsTab).catch(err => {
         console.warn('[MarketAI] SYMBOLS sheet fetch failed:', err.message);
         return null;
       }),
-      fetchJSONP('NSE')
+      fetchJSONP(SHEET_CONFIG.nseTab)
     ])
     .then(([symbolsData, nseData]) => {
       try {
@@ -1764,7 +1966,7 @@ function fetchFromGoogleSheetsRealtime() {
         console.log(`[MarketAI] Direct sheet fetch: ${validSnaps.length} snapshots, ${symsSet.size} symbols`);
 
         resolve({
-          snapshots: validSnaps,
+          snapshots: dedupeSnapshotsByTs(validSnaps),
           symbols: [...symsSet].sort(),
           lastSync: Date.now(),
           syncCount: 1,
@@ -1845,13 +2047,6 @@ async function doSync(silent=false){
       console.warn('Server sync failed, falling back to direct browser sync from Google Sheets:', apiErr);
       setLoad(50);
       d = await fetchFromGoogleSheetsRealtime();
-      try {
-        localStorage.setItem('marketai_cache', JSON.stringify({
-          snapshots: d.snapshots.slice(-5),
-          symbols: d.symbols,
-          lastSync: d.lastSync
-        }));
-      } catch(e) {}
     }
     mergeData(d);
     setLoad(100);
@@ -1869,7 +2064,7 @@ async function doSync(silent=false){
 }
 
 function mergeData(d){
-  if(d.snapshots)S.snapshots=d.snapshots.sort((a,b)=>a.ts-b.ts);
+  if(d.snapshots)S.snapshots=dedupeSnapshotsByTs(d.snapshots);
   if(d.symbols)S.symbols=d.symbols;
   if(d.lastSync)S.lastSync=d.lastSync;
   if(d.portfolio)S.portfolio=d.portfolio;
@@ -1878,22 +2073,7 @@ function mergeData(d){
   if(d.alerts)S.alerts=d.alerts;
   if(d.screeners)S.screeners=d.screeners;
   precomputeCache();
-
-  // Save to localStorage (limit to latest 5 snapshots to prevent QuotaExceededError)
-  try {
-    localStorage.setItem('marketai_cache', JSON.stringify({
-      snapshots: S.snapshots.slice(-5),
-      symbols: S.symbols,
-      lastSync: S.lastSync,
-      portfolio: S.portfolio,
-      watchlists: S.watchlists,
-      watchlistItems: S.watchlistItems,
-      alerts: S.alerts,
-      screeners: S.screeners
-    }));
-  } catch(e) {
-    console.warn('Failed to save to localStorage:', e);
-  }
+  saveLocalCache();
 }
 
 // ── Groq AI ──────────────────────────────────────────────────────────────────
@@ -1941,7 +2121,7 @@ function closeModal(){
 function renderTicker(){
   const el=document.getElementById('ticker');
   const inner=document.getElementById('tickerInner');
-  const validSyms=S.symbols.filter(s=>{const st=stats(s);return st&&st.count>=2;});
+  const validSyms=S.symbols.filter(s=>{const st=stats(s);return st&&st.count>=1;});
   if(!validSyms.length){el.style.display='none';return;}
   el.style.display='block';
   const items=validSyms.slice(0,60).map(sym=>{
@@ -1962,7 +2142,7 @@ function setSbTab(t,el){
 }
 function renderSidebar(){
   const q=(document.getElementById('sbSearch')?.value||'').toUpperCase();
-  let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=2;});
+  let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=1;});
   if(q)syms=syms.filter(s=>s.includes(q));
   if(sbTab==='gain')syms=syms.filter(s=>{const c=change(s);return c&&c.pct>0.01;});
   if(sbTab==='loss')syms=syms.filter(s=>{const c=change(s);return c&&c.pct<-0.01;});
@@ -2025,6 +2205,7 @@ Pages.dashboard=function(el){
   const gainers=topGainers(8).map(x=>x.sym);
   const losers=topLosers(8).map(x=>x.sym);
   const hammers=hammerSignals().slice(0,8);
+  const dzones=demandZones();
   const picks=autoPicks(6);
 
   el.innerHTML=`
@@ -2044,6 +2225,7 @@ Pages.dashboard=function(el){
         <div class="kpi ka"><div class="kpi-lbl">Advancing</div><div class="kpi-val up">${sum.advances}</div><div class="kpi-sub">${sum.total?((sum.advances/sum.total)*100).toFixed(1)+'%':''} of market</div></div>
         <div class="kpi kr"><div class="kpi-lbl">Declining</div><div class="kpi-val dn">${sum.declines}</div><div class="kpi-sub">${sum.total?((sum.declines/sum.total)*100).toFixed(1)+'%':''} of market</div></div>
         <div class="kpi kb"><div class="kpi-lbl">Hammer Signals</div><div class="kpi-val" style="color:var(--blue)">${hammers.length}</div><div class="kpi-sub">Reversal patterns</div></div>
+        <div class="kpi"><div class="kpi-lbl">Demand Zones</div><div class="kpi-val" style="color:var(--green)">${dzones.filter(z=>z.notTested).length}</div><div class="kpi-sub">${dzones.length} total zones</div></div>
         <div class="kpi"><div class="kpi-lbl">AI Picks</div><div class="kpi-val" style="color:var(--purple)">${picks.length}</div><div class="kpi-sub">Top momentum stocks</div></div>
       </div>
 
@@ -2089,6 +2271,26 @@ Pages.dashboard=function(el){
         </table></div>
       </div>`:''}
 
+      ${dzones.filter(z=>z.notTested).length?`
+      <div>
+        <div class="sec-hdr"><div class="sec-title">Demand Zone Signals</div><div class="sec-line"></div><div class="sec-count">${dzones.filter(z=>z.notTested).length} not tested</div>
+          <button class="btn btn-sm btn-ghost" onclick="nav('demandzones')">View All</button>
+        </div>
+        <div class="tbl-wrap"><table>
+          <thead><tr><th>Symbol</th><th>Detected</th><th>Proximal</th><th>Distal</th><th>Distance</th><th>Bases</th></tr></thead>
+          <tbody>${dzones.filter(z=>z.notTested).slice(0,8).map(z=>{
+            return '<tr onclick="openStock(\''+z.sym+'\')" style="cursor:pointer">'+
+              '<td class="td-sym">'+z.sym+'</td>'+
+              '<td style="color:var(--t3);font-size:10px">'+(z.label||fds(z.ts))+'</td>'+
+              '<td style="font-weight:700;color:var(--accent)">'+fp(z.proximal)+'</td>'+
+              '<td style="color:var(--t3)">'+fp(z.distal)+'</td>'+
+              '<td class="up" style="font-weight:700">'+(z.distPct!==null?z.distPct.toFixed(1)+'%':'—')+'</td>'+
+              '<td style="font-size:11px">'+'▌'.repeat(z.numBases)+z.numBases+'</td>'+
+              '</tr>';}).join('')}
+          </tbody>
+        </table></div>
+      </div>`:''}
+
       <!-- Gainers / Losers -->
       <div class="grid2">
         ${glCard('Top Gainers',gainers)}
@@ -2113,6 +2315,13 @@ Pages.more = function(el) {
   </div>
   <div class="page-body">
     <div class="more-grid">
+      <div class="more-card" onclick="nav('demandzones')">
+        <div class="more-card-icon">📊</div>
+        <div class="more-card-info">
+          <div class="more-card-title">Demand Zones</div>
+          <div class="more-card-desc">Rally-Base-Rally patterns with proximal and distal levels</div>
+        </div>
+      </div>
       <div class="more-card" onclick="nav('patterns')">
         <div class="more-card-icon">🎯</div>
         <div class="more-card-info">
@@ -2186,7 +2395,7 @@ Pages.stocks=function(el){
   const pageSize=100;
 
   function render(){
-    let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=2;});
+    let syms=[...S.symbols].filter(s=>{const st=stats(s);return st&&st.count>=1;});
     if(q)syms=syms.filter(s=>s.includes(q.toUpperCase()));
     if(tab==='gain')syms=syms.filter(s=>{const c=change(s);return c&&c.pct>0.01;});
     if(tab==='loss')syms=syms.filter(s=>{const c=change(s);return c&&c.pct<-0.01;});
@@ -2461,11 +2670,65 @@ Pages.patterns=function(el){
   render();
 };
 
+// ── DEMAND ZONES ──────────────────────────────────────────────────────────────
+Pages.demandzones=function(el){
+  let filterStatus='all',q='';
+  function render(){
+    let zones=demandZones();
+    if(filterStatus==='tested')zones=zones.filter(z=>z.tested);
+    if(filterStatus==='notested')zones=zones.filter(z=>z.notTested);
+    if(q)zones=zones.filter(z=>z.sym.includes(q.toUpperCase()));
+    el.innerHTML=`
+    <div class="page-hdr">
+      <div><div class="page-title">Demand Zones</div><div class="page-sub">${zones.length} Rally-Base-Rally patterns</div></div>
+    </div>
+    <div style="padding:10px 18px;border-bottom:1px solid var(--b1);background:var(--s1);display:flex;gap:10px;flex-wrap:wrap;align-items:center;flex-shrink:0">
+      <input placeholder="Symbol..." oninput="dzQ(this.value)" style="font-size:11px;padding:5px 9px;width:130px">
+      <select onchange="dzStatus(this.value)" style="font-size:11px;padding:5px 9px">
+        <option value="all">All Status</option>
+        <option value="notested">Not Tested</option>
+        <option value="tested">Tested</option>
+      </select>
+      <button class="btn btn-sm btn-ghost" onclick="dzReset()">Reset</button>
+      <div style="font-size:10px;color:var(--t3);margin-left:auto">
+        <span style="color:var(--green);font-weight:700">${zones.filter(z=>z.notTested).length}</span> not tested
+        · <span style="color:var(--t3)">${zones.filter(z=>z.tested).length}</span> tested
+      </div>
+    </div>
+    <div style="flex:1;overflow:auto">
+      ${!zones.length?`<div class="empty"><div class="empty-title">No demand zones</div><div class="empty-sub">${S.symbols.length?'Not enough daily data to detect Rally-Base-Rally patterns':'Sync data first'}</div></div>`:`
+      <div class="tbl-wrap" style="margin:0"><table>
+        <thead><tr><th>Symbol</th><th>Detected</th><th>Proximal</th><th>Distal</th><th>Zone Size</th><th>Bases</th><th>Status</th><th>Distance</th></tr></thead>
+        <tbody>${zones.map(z=>{
+          const cur=latestPrice(z.sym);const c=change(z.sym);
+          const zoneSize=z.proximal-z.distal;
+          const statusClass=z.notTested?'up':z.tested?'dn':'nu';
+          const statusBadge=z.notTested?'<span class="badge badge-g">Not Tested</span>':z.tested?'<span class="badge badge-r">Tested</span>':'<span class="badge badge-y">Partial</span>';
+          return '<tr onclick="openStock(\''+z.sym+'\')" style="cursor:pointer">'+
+            '<td class="td-sym">'+z.sym+'</td>'+
+            '<td style="color:var(--t3);font-size:10px">'+(z.label||fds(z.ts))+'</td>'+
+            '<td style="font-weight:700;color:var(--accent)">'+fp(z.proximal)+'</td>'+
+            '<td style="color:var(--t3)">'+fp(z.distal)+'</td>'+
+            '<td style="color:var(--t3);font-size:11px">'+fp(zoneSize)+'</td>'+
+            '<td style="font-size:11px">'+'▌'.repeat(z.numBases)+'<span style="color:var(--t3)">'+z.numBases+'</span></td>'+
+            '<td>'+statusBadge+'</td>'+
+            '<td style="font-weight:700" class="'+statusClass+'">'+(z.distPct!==null?z.distPct.toFixed(1)+'%':'—')+'</td>'+
+            '</tr>';}).join('')}
+        </tbody>
+      </table></div>`}
+    </div>`;
+    window.dzQ=v=>{q=v;render();};
+    window.dzStatus=v=>{filterStatus=v;render();};
+    window.dzReset=()=>{filterStatus='all';q='';render();};
+  }
+  render();
+};
+
 function getAllPatterns(){
   const out=[];
   for(const sym of S.symbols){
     const sr=series(sym);
-    const pr=sr.map(s=>s.prices[sym]).filter(p=>typeof p==='number'&&isFinite(p)&&p>0);
+    const pr=sr.map(s=>s.price).filter(p=>typeof p==='number'&&isFinite(p)&&p>0);
     if(pr.length<3)continue;
     
     for(let i=2;i<pr.length;i++){
@@ -2871,8 +3134,8 @@ Pages.settings=function(el){
         The app fetches from Google Sheets via a Vercel serverless function on every page load, and every 10 minutes via a cron job during market hours. All data is stored in <code style="color:var(--accent)">data.json</code> on the server or in Vercel KV.
       </div>
       <div class="info-rows">
-        <div class="ir"><span class="ir-key">Sheet Link</span><span class="ir-val" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis"><a href="https://docs.google.com/spreadsheets/d/1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA/edit?gid=1599878998#gid=1599878998" target="_blank">Spreadsheet (NSE)</a></span></div>
-        <div class="ir"><span class="ir-key">Tab</span><span class="ir-val">NSE</span></div>
+        <div class="ir"><span class="ir-key">Sheet Link</span><span class="ir-val" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis"><a href="https://docs.google.com/spreadsheets/d/${SHEET_CONFIG.id}/edit" target="_blank">Spreadsheet (${SHEET_CONFIG.nseTab})</a></span></div>
+        <div class="ir"><span class="ir-key">Tab</span><span class="ir-val">${SHEET_CONFIG.nseTab}</span></div>
         <div class="ir"><span class="ir-key">Snapshots stored</span><span class="ir-val">${S.snapshots.length.toLocaleString()}</span></div>
         <div class="ir"><span class="ir-key">Symbols tracked</span><span class="ir-val">${S.symbols.length.toLocaleString()}</span></div>
         <div class="ir"><span class="ir-key">Last sync</span><span class="ir-val">${S.lastSync?fdt(S.lastSync):'Never'}</span></div>

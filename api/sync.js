@@ -276,6 +276,17 @@ function parsePrice(raw) {
   if (!raw) return null;
   const s = clean(raw);
   if (!s || ["#N/A","N/A","#VALUE!","#REF!","#ERROR!","#NUM!","Loading..."].includes(s)) return null;
+
+  // Try OHLC format first: "close,open,high,low"
+  const parts = s.split(',');
+  if (parts.length === 4) {
+    const nums = parts.map(p => parseFloat(p.trim()));
+    if (nums.every(n => isFinite(n) && n > 0)) {
+      return { c: nums[0], o: nums[1], h: nums[2], l: nums[3] };
+    }
+  }
+
+  // Fallback: single number (old format)
   let n = parseFloat(s);
   if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
   return isFinite(n) && n > 0 ? n : null;
@@ -495,7 +506,17 @@ module.exports = async (req, res) => {
       const priceVals = Object.values(s.prices);
       if (priceVals.length === 0) return false;
       for (const p of priceVals) {
-        if (typeof p !== "number" || !isFinite(p) || p <= 0) return false;
+        if (typeof p === "number") {
+          if (!isFinite(p) || p <= 0) return false;
+        } else if (p && typeof p === "object") {
+          const { c, o, h, l } = p;
+          if (typeof c !== "number" || !isFinite(c) || c <= 0) return false;
+          if (typeof o !== "number" || !isFinite(o) || o <= 0) return false;
+          if (typeof h !== "number" || !isFinite(h) || h <= 0) return false;
+          if (typeof l !== "number" || !isFinite(l) || l <= 0) return false;
+        } else {
+          return false;
+        }
       }
       return true;
     });
