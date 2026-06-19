@@ -272,24 +272,34 @@ function parseTimestamp(raw) {
   return (!isNaN(ts) && ts >= 946684800000 && ts <= 4102444800000) ? ts : null;
 }
 
+// Pre-computed Set for O(1) lookup vs Array.includes O(n)
+const BAD_VALUES = new Set(["#N/A","N/A","#VALUE!","#REF!","#ERROR!","#NUM!","Loading..."]);
+
 function parsePrice(raw) {
   if (!raw) return null;
   const s = clean(raw);
-  if (!s || ["#N/A","N/A","#VALUE!","#REF!","#ERROR!","#NUM!","Loading..."].includes(s)) return null;
+  if (!s || BAD_VALUES.has(s)) return null;
 
-  // Try OHLC format first: "close,open,high,low"
+  // Fast path: skip split/map/every for single numbers (~99% of cells)
+  if (s.indexOf(',') === -1) {
+    let n = parseFloat(s);
+    if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
+    return isFinite(n) && n > 0 ? n : null;
+  }
+
+  // OHLC format: "close,open,high,low"
   const parts = s.split(',');
   if (parts.length === 4) {
-    const nums = parts.map(p => parseFloat(p.trim()));
-    if (nums.every(n => isFinite(n) && n > 0)) {
-      return { c: nums[0], o: nums[1], h: nums[2], l: nums[3] };
+    const c = parseFloat(parts[0]);
+    const o = parseFloat(parts[1]);
+    const h = parseFloat(parts[2]);
+    const l = parseFloat(parts[3]);
+    if (isFinite(c) && c > 0 && isFinite(o) && o > 0 && isFinite(h) && h > 0 && isFinite(l) && l > 0) {
+      return { c, o, h, l };
     }
   }
 
-  // Fallback: single number (old format)
-  let n = parseFloat(s);
-  if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
-  return isFinite(n) && n > 0 ? n : null;
+  return null;
 }
 
 // ── Banded DP Sequence Alignment (old sheet format only) ─────────────────────

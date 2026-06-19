@@ -1128,339 +1128,124 @@ function precomputeCache() {
   Cache.change = {};
   Cache.topGainers = [];
   Cache.topLosers = [];
-  Cache.autoPicks = [];
-  Cache.hammers = [];
-  Cache.demandZones = [];
+  Cache.autoPicks = null;
+  Cache.hammers = null;
+  Cache.demandZones = null;
   Cache.summary = { total: 0, advances: 0, declines: 0, unchanged: 0 };
 
-  // 1. Build symbol histories (supports both single close price and OHLC objects)
-  for (let i = 0; i < S.snapshots.length; i++) {
-    const snap = S.snapshots[i];
+  // 1. Build symbol histories — for..in avoids Object.entries array alloc
+  const snaps = S.snapshots;
+  const snapLen = snaps.length;
+  for (let i = 0; i < snapLen; i++) {
+    const snap = snaps[i];
     if (!snap || typeof snap.ts !== 'number' || !snap.prices) continue;
-    for (const [sym, raw] of Object.entries(snap.prices)) {
+    const ts = snap.ts, label = snap.label, rawPrices = snap.prices;
+    for (const sym in rawPrices) {
+      const raw = rawPrices[sym];
       let price, ohlc;
-      if (typeof raw === 'number' && isFinite(raw) && raw > 0) {
+      if (typeof raw === 'number' && raw > 0) {
         price = raw;
-      } else if (raw && typeof raw === 'object' && typeof raw.c === 'number' && isFinite(raw.c) && raw.c > 0) {
-        price = raw.c;
-        ohlc = raw;
+      } else if (raw && typeof raw === 'object' && typeof raw.c === 'number' && raw.c > 0) {
+        price = raw.c; ohlc = raw;
       } else continue;
-      if (!Cache.histories[sym]) Cache.histories[sym] = [];
-      const hist = Cache.histories[sym];
-      const last = hist[hist.length - 1];
-      if (last && last.ts === snap.ts) {
-        last.label = snap.label;
-        last.price = price;
+      let hist = Cache.histories[sym];
+      if (!hist) hist = Cache.histories[sym] = [];
+      const hLen = hist.length;
+      if (hLen > 0 && hist[hLen - 1].ts === ts) {
+        const last = hist[hLen - 1];
+        last.label = label; last.price = price;
         if (ohlc) last.ohlc = ohlc;
       } else {
-        hist.push({ ts: snap.ts, label: snap.label, price, ...(ohlc ? { ohlc } : {}) });
+        hist.push({ ts, label, price, ...(ohlc ? { ohlc } : {}) });
       }
     }
   }
 
-  // 2. Precompute individual symbol stats
-  S.symbols.forEach(sym => {
-    const history = Cache.histories[sym] || [];
-    if (history.length === 0) {
-      Cache.latestPrice[sym] = null;
-      Cache.prevPrice[sym] = null;
-      Cache.change[sym] = null;
-      Cache.stats[sym] = null;
-      return;
+  // 2. Single-pass stats — pre-allocated array, no spread, no extra .map/.reduce
+  const symbols = S.symbols;
+  const symLen = symbols.length;
+  const gainers = [];
+  const losers = [];
+  let adv = 0, dec = 0, unc = 0;
+
+  for (let si = 0; si < symLen; si++) {
+    const sym = symbols[si];
+    const history = Cache.histories[sym];
+    if (!history || history.length === 0) {
+      Cache.latestPrice[sym] = null; Cache.prevPrice[sym] = null;
+      Cache.change[sym] = null; Cache.stats[sym] = null;
+      unc++; continue;
     }
-    
-    const prices = history.map(h => h.price);
-    const len = prices.length;
+
+    const len = history.length;
+    const prices = new Array(len);
+    for (let i = 0; i < len; i++) prices[i] = history[i].price;
+
     const latest = prices[len - 1];
     const prev = len >= 2 ? prices[len - 2] : null;
-    
     Cache.latestPrice[sym] = latest;
     Cache.prevPrice[sym] = prev;
-    
+
+    let chg = null;
     if (latest !== null && prev !== null && prev > 0) {
       const abs = latest - prev;
       const pct = abs / prev * 100;
-      Cache.change[sym] = isFinite(pct) ? { abs, pct } : null;
-    } else {
-      Cache.change[sym] = null;
+      chg = isFinite(pct) ? { abs, pct } : null;
     }
-    
-    const hi = Math.max(...prices);
-    const lo = Math.min(...prices);
-    const avg = prices.reduce((a, b) => a + b, 0) / len;
+    Cache.change[sym] = chg;
+
+    // Single pass: hi, lo, sum, vol (no Math.max(...spread), no .reduce)
+    let hi = -Infinity, lo = Infinity, sum = 0;
+    for (let i = 0; i < len; i++) {
+      const p = prices[i];
+      if (p > hi) hi = p;
+      if (p < lo) lo = p;
+      sum += p;
+    }
+    const avg = sum / len;
     const first = prices[0];
-    const rets = [];
+
+    // Volatility: single pass for mean, then variance
+    let retSum = 0, retCount = 0;
     for (let i = 1; i < len; i++) {
       const ret = (prices[i] - prices[i - 1]) / prices[i - 1];
-      if (isFinite(ret)) rets.push(ret);
+      if (isFinite(ret)) { retSum += ret; retCount++; }
     }
-    const mean = rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : 0;
-    const variance = rets.length ? rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length : 0;
-    const vol = Math.sqrt(Math.max(0, variance)) * 100;
+    const mean = retCount ? retSum / retCount : 0;
+    let varSum = 0;
+    for (let i = 1; i < len; i++) {
+      const ret = (prices[i] - prices[i - 1]) / prices[i - 1];
+      if (isFinite(ret)) { const d = ret - mean; varSum += d * d; }
+    }
+    const vol = Math.sqrt(retCount ? varSum / retCount : 0) * 100;
     const pctReturn = first > 0 ? (latest - first) / first * 100 : 0;
-    
+
     Cache.stats[sym] = {
       hi, lo, avg, first, last: latest, count: len,
       pct: isFinite(pctReturn) ? pctReturn : 0,
       vol: isFinite(vol) ? vol : 0,
       prices, series: history
     };
-  });
 
-  // 3. Precompute global lists
-  Cache.topGainers = S.symbols.map(s => {
-    const c = Cache.change[s];
-    const st = Cache.stats[s];
-    return { sym: s, c, st };
-  }).filter(x => x.c && x.c.pct > 0 && x.st && x.st.count >= 2).sort((a, b) => b.c.pct - a.c.pct);
-  
-  Cache.topLosers = S.symbols.map(s => {
-    const c = Cache.change[s];
-    const st = Cache.stats[s];
-    return { sym: s, c, st };
-  }).filter(x => x.c && x.c.pct < 0 && x.st && x.st.count >= 2).sort((a, b) => a.c.pct - b.c.pct);
-
-  let a = 0, d = 0, u = 0;
-  S.symbols.forEach(s => {
-    const c = Cache.change[s];
-    if (!c) u++;
-    else if (c.pct > 0.01) a++;
-    else if (c.pct < -0.01) d++;
-    else u++;
-  });
-  Cache.summary = { total: S.symbols.length, advances: a, declines: d, unchanged: u };
-
-  // autoPicks
-  const picks = [];
-  for (const sym of S.symbols) {
-    const st = Cache.stats[sym];
-    if (!st || st.count < 3 || st.prices.length < 2) continue;
-    const c = Cache.change[sym];
-    if (!c) continue;
-    
-    let score = 0, reasons = [];
-    const avg = st.avg, last = st.last;
-    
-    if (last > avg) { score += 25; reasons.push('Above avg'); }
-    if (last < avg) { score -= 10; }
-    
-    const rsi = calcRSI(st.prices);
-    if (rsi < 35) { score += 20; reasons.push('RSI oversold'); }
-    else if (rsi < 50 && last > avg) { score += 10; reasons.push('RSI rising'); }
-    else if (rsi > 70) { score -= 15; }
-    
-    if (st.pct > 5) { score += 20; reasons.push(`+${st.pct.toFixed(1)}%`); }
-    else if (st.pct > 2) { score += 10; }
-    else if (st.pct < -5) { score -= 20; }
-    
-    if (st.vol >= 0 && st.vol < 2 && last > avg) { score += 10; reasons.push('Low vol'); }
-    
-    const fromLo = st.lo > 0 ? ((last - st.lo) / st.lo * 100) : 0;
-    if (fromLo >= 0 && fromLo < 5) { score += 10; reasons.push('Near low'); }
-    else if (fromLo > 80) { score -= 10; }
-    
-    if (score >= 35) picks.push({ sym, score: Math.min(100, Math.max(0, score)), reason: reasons.slice(0, 2).join(' · '), c });
+    // Summary + gainers/losers in same pass (no separate .map/.filter/.sort)
+    if (!chg) unc++;
+    else if (chg.pct > 0.01) { adv++; gainers.push({ sym, c: chg, st: Cache.stats[sym] }); }
+    else if (chg.pct < -0.01) { dec++; losers.push({ sym, c: chg, st: Cache.stats[sym] }); }
+    else unc++;
   }
-  Cache.autoPicks = picks.sort((a, b) => b.score - a.score);
 
-  // hammerSignals
-  const hammersList = [];
-  for (const sym of S.symbols) {
-    const history = Cache.histories[sym] || [];
-    const len = history.length;
-    if (len < 15) continue;
-    
-    const priceArr = new Float64Array(len);
-    for (let i = 0; i < len; i++) {
-      priceArr[i] = history[i].price;
-    }
+  gainers.sort((a, b) => b.c.pct - a.c.pct);
+  losers.sort((a, b) => a.c.pct - b.c.pct);
+  Cache.topGainers = gainers;
+  Cache.topLosers = losers;
+  Cache.summary = { total: symLen, advances: adv, declines: dec, unchanged: unc };
 
-    const isDown = new Uint8Array(len - 1);
-    for (let i = 0; i < len - 1; i++) {
-      isDown[i] = priceArr[i] > priceArr[i+1] ? 1 : 0;
-    }
+  // autoPicks deferred to lazy compute (expensive: RSI per symbol)
+  Cache.autoPicks = null;
 
-    let runningDownSum = 0;
-    for (let i = 0; i < 14; i++) {
-      runningDownSum += isDown[i];
-    }
-
-    for (let hammerIdx = 14; hammerIdx < len - 1; hammerIdx++) {
-      if (runningDownSum >= 12) {
-        const prevPrice = priceArr[hammerIdx-1];
-        const hammerPrice = priceArr[hammerIdx];
-        const nextPrice = priceArr[hammerIdx+1];
-        
-        const open = prevPrice;
-        const close = hammerPrice;
-        const high = Math.max(prevPrice, hammerPrice);
-        const low = Math.min(prevPrice, hammerPrice);
-        
-        const body = Math.abs(close-open) || (hammerPrice * 0.001);
-        const upperShadow = high - Math.max(open, close);
-        const lowerShadow = Math.min(open, close) - low;
-        
-        if (upperShadow < body && lowerShadow > body && lowerShadow > (body * 0.5)) {
-          if (nextPrice > hammerPrice) {
-            const shadowRatio = lowerShadow / (upperShadow || 1);
-            const bodySmallness = Math.max(0, 1 - ((body / hammerPrice) * 100 / 2));
-            const strength = Math.min(100, Math.round((shadowRatio * 40) + (bodySmallness * 60)));
-            
-            let score = 50;
-            score += (strength * 0.3);
-            if ((nextPrice - hammerPrice) / hammerPrice > 0.005) score += 15;
-            if (lowerShadow / high > 0.2) score += 10;
-            score = Math.min(100, Math.round(score));
-            
-            if (score >= 50) {
-              hammersList.push({
-                sym,
-                ts: history[hammerIdx].ts,
-                label: history[hammerIdx].label,
-                price: hammerPrice,
-                entry: prevPrice,
-                nextPrice,
-                score,
-                strength,
-                reason: `15d downtrend, green confirmation`
-              });
-            }
-          }
-        }
-      }
-      runningDownSum = runningDownSum - isDown[hammerIdx - 14] + isDown[hammerIdx];
-    }
-  }
-  Cache.hammers = hammersList.sort((a, b) => b.score - a.score);
-
-  // demandZones — Rally-Base(s)-Rally detection (supports OHLC and close-only)
-  const zones = [];
-  const MAX_BASES = 4;
-  // Close-only fallback threshold (used when no OHLC data available)
-  const BASE_PCT = 0.5;
-
-  for (const sym of S.symbols) {
-    const history = Cache.histories[sym] || [];
-    if (history.length < 5) continue;
-
-    // Build candles using OHLC data when available, close-only fallback otherwise
-    const candles = [];
-    for (let i = 0; i < history.length; i++) {
-      const cur = history[i];
-      const prev = i > 0 ? history[i-1] : null;
-
-      let o, c, h, l, hasOHLC = false;
-
-      if (cur.ohlc) {
-        o = cur.ohlc.o; c = cur.ohlc.c;
-        h = cur.ohlc.h; l = cur.ohlc.l;
-        hasOHLC = true;
-      } else if (prev) {
-        o = prev.price; c = cur.price;
-        h = Math.max(o, c); l = Math.min(o, c);
-      } else {
-        candles.push(null); continue;
-      }
-
-      if (!isFinite(o) || !isFinite(c) || !isFinite(h) || !isFinite(l) ||
-          o <= 0 || c <= 0 || h <= 0 || l <= 0) {
-        candles.push(null); continue;
-      }
-
-      const body = Math.abs(c - o);
-      const range = h - l || 0.001;
-      const bodyRatio = body / range;
-      const ret = (c - o) / o * 100;
-      const isGreen = c >= o;
-
-      candles.push({
-        o, c, h, l, body, range, bodyRatio, ret, isGreen, hasOHLC,
-        ts: cur.ts,
-        label: cur.label
-      });
-    }
-
-    const len = candles.length;
-    if (len < 5) continue;
-
-    // Scan from newest to oldest to find the latest R-B-R pattern
-    let found = false;
-    for (let i = len - 3; i >= 0 && !found; i--) {
-      const c1 = candles[i];
-      if (!c1) continue;
-
-      // Classify first candle as Rally
-      const c1IsRally = c1.hasOHLC ? (c1.isGreen && c1.bodyRatio >= 0.5) : (c1.isGreen);
-      if (!c1IsRally) continue;
-
-      // Count consecutive bases after i
-      let nb = 0;
-      for (let j = i + 1; j < Math.min(i + 1 + MAX_BASES, len); j++) {
-        const b = candles[j];
-        if (!b) { nb = 0; break; }
-        // Base = body <= 50% of range (OHLC) OR small return (close-only)
-        const isBase = b.hasOHLC ? (b.bodyRatio < 0.5) : (Math.abs(b.ret) <= BASE_PCT);
-        if (isBase) nb++;
-        else break;
-      }
-      if (nb === 0) continue;
-
-      const r2Idx = i + 1 + nb;
-      if (r2Idx >= len) continue;
-      const c2 = candles[r2Idx];
-      if (!c2) continue;
-
-      // Classify second candle as Rally (green with body >= 50%)
-      const c2IsRally = c2.hasOHLC ? (c2.isGreen && c2.bodyRatio >= 0.5) : (c2.isGreen);
-      if (!c2IsRally) continue;
-
-      // Second rally close must be above first rally close
-      if (c2.c <= c1.c) continue;
-
-      found = true;
-
-      // Compute proximal = top of highest base body (max of max(o,c) across bases)
-      let proximal = -Infinity;
-      // Compute distal = lowest low among bases (min of l across bases)
-      let distal = Infinity;
-      for (let k = i + 1; k < r2Idx; k++) {
-        const bc = candles[k];
-        if (!bc) continue;
-        const bodyTop = Math.max(bc.o, bc.c);
-        if (bodyTop > proximal) proximal = bodyTop;
-        if (bc.l < distal) distal = bc.l;
-      }
-
-      // Tested: any subsequent candle (after rally2) has low <= proximal
-      let tested = false;
-      for (let k = r2Idx + 1; k < len; k++) {
-        const cc = candles[k];
-        if (cc && cc.l <= proximal) { tested = true; break; }
-      }
-
-      // Not tested: LTP > proximal * 1.02
-      const ltp = Cache.latestPrice[sym];
-      const notTested = ltp !== null && ltp > proximal * 1.02;
-
-      zones.push({
-        sym,
-        ts: c2.ts,
-        label: c2.label,
-        proximal: +proximal.toFixed(2),
-        distal: +distal.toFixed(2),
-        rally1Close: +c1.c.toFixed(2),
-        rally2Close: +c2.c.toFixed(2),
-        numBases: nb,
-        tested,
-        notTested,
-        distPct: ltp !== null ? +((ltp - proximal) / proximal * 100).toFixed(2) : null
-      });
-    }
-  }
-  Cache.demandZones = zones.sort((a, b) => {
-    if (a.notTested !== b.notTested) return a.notTested ? -1 : 1;
-    return b.ts - a.ts;
-  });
+  // hammerSignals and demandZones deferred to lazy compute
+  Cache.hammers = null;
+  Cache.demandZones = null;
 }
 
 // ── Core computations ────────────────────────────────────────────────────────
@@ -1487,20 +1272,22 @@ function stats(sym,period='all'){
     return Cache.stats[sym] !== undefined ? Cache.stats[sym] : null;
   }
   const sr=series(sym,period);
-  const pr=sr.map(s=>s.price);
-  if(!pr.length)return null;
-  const hi=Math.max(...pr),lo=Math.min(...pr),avg=pr.reduce((a,b)=>a+b,0)/pr.length;
-  const first=pr[0],last=pr[pr.length-1];
-  const rets=[];
-  for(let i=1;i<pr.length;i++){
-    const ret=(pr[i]-pr[i-1])/pr[i-1];
-    if(isFinite(ret))rets.push(ret);
-  }
-  const mean=rets.length?rets.reduce((a,b)=>a+b,0)/rets.length:0;
-  const variance=rets.length?rets.reduce((a,b)=>a+(b-mean)**2,0)/rets.length:0;
-  const vol=Math.sqrt(Math.max(0,variance))*100;
+  const prLen=sr.length;
+  if(!prLen)return null;
+  const pr=new Array(prLen);
+  for(let i=0;i<prLen;i++) pr[i]=sr[i].price;
+  let hi=-Infinity,lo=Infinity,sum=0;
+  for(let i=0;i<prLen;i++){const p=pr[i];if(p>hi)hi=p;if(p<lo)lo=p;sum+=p;}
+  const avg=sum/prLen;
+  const first=pr[0],last=pr[prLen-1];
+  let retSum=0,retCount=0;
+  for(let i=1;i<prLen;i++){const ret=(pr[i]-pr[i-1])/pr[i-1];if(isFinite(ret)){retSum+=ret;retCount++;}}
+  const mean=retCount?retSum/retCount:0;
+  let varSum=0;
+  for(let i=1;i<prLen;i++){const ret=(pr[i]-pr[i-1])/pr[i-1];if(isFinite(ret)){const d=ret-mean;varSum+=d*d;}}
+  const vol=Math.sqrt(retCount?varSum/retCount:0)*100;
   const pctReturn=first>0?(last-first)/first*100:0;
-  return{hi,lo,avg,first,last,count:sr.length,pct:isFinite(pctReturn)?pctReturn:0,vol:isFinite(vol)?vol:0,prices:pr,series:sr};
+  return{hi,lo,avg,first,last,count:prLen,pct:isFinite(pctReturn)?pctReturn:0,vol:isFinite(vol)?vol:0,prices:pr,series:sr};
 }
 function topGainers(n=10){
   return Cache.topGainers.slice(0,n);
@@ -1514,22 +1301,238 @@ function summary(){
 
 // Auto picks (momentum + pattern score)
 function autoPicks(n=6){
+  if (Cache.autoPicks === null) computeAutoPicks();
   return Cache.autoPicks.slice(0,n);
 }
 function calcRSI(prices,n=14){
-  if(prices.length<n+1)return 50;
-  const diffs=prices.slice(1).map((p,i)=>p-prices[i]);
-  const recent=diffs.slice(-n);
-  const gains=recent.filter(d=>d>0).reduce((a,b)=>a+b,0)/n;
-  const losses=recent.filter(d=>d<0).map(d=>-d).reduce((a,b)=>a+b,0)/n;
+  const len=prices.length;
+  if(len<n+1)return 50;
+  let gains=0,losses=0;
+  for(let i=len-n;i<len;i++){
+    const d=prices[i]-prices[i-1];
+    if(d>0)gains+=d;else losses+=(-d);
+  }
+  gains/=n;losses/=n;
   if(losses===0)return 100;
   return 100-100/(1+gains/losses);
 }
 function hammerSignals(){
+  if (Cache.hammers === null) computeHammers();
   return Cache.hammers;
 }
 function demandZones(){
+  if (Cache.demandZones === null) computeDemandZones();
   return Cache.demandZones;
+}
+
+// ── Lazy compute: autoPicks (RSI + momentum scoring per symbol) ──────────────
+function computeAutoPicks() {
+  const picks = [];
+  const symbols = S.symbols;
+  for (let si = 0; si < symbols.length; si++) {
+    const sym = symbols[si];
+    const st = Cache.stats[sym];
+    if (!st || st.count < 3 || st.prices.length < 2) continue;
+    const c = Cache.change[sym];
+    if (!c) continue;
+
+    let score = 0, reasons = [];
+    const avg = st.avg, last = st.last;
+
+    if (last > avg) { score += 25; reasons.push('Above avg'); }
+    else if (last < avg) { score -= 10; }
+
+    const rsi = calcRSI(st.prices);
+    if (rsi < 35) { score += 20; reasons.push('RSI oversold'); }
+    else if (rsi < 50 && last > avg) { score += 10; reasons.push('RSI rising'); }
+    else if (rsi > 70) { score -= 15; }
+
+    if (st.pct > 5) { score += 20; reasons.push(`+${st.pct.toFixed(1)}%`); }
+    else if (st.pct > 2) { score += 10; }
+    else if (st.pct < -5) { score -= 20; }
+
+    if (st.vol >= 0 && st.vol < 2 && last > avg) { score += 10; reasons.push('Low vol'); }
+
+    const fromLo = st.lo > 0 ? ((last - st.lo) / st.lo * 100) : 0;
+    if (fromLo >= 0 && fromLo < 5) { score += 10; reasons.push('Near low'); }
+    else if (fromLo > 80) { score -= 10; }
+
+    if (score >= 35) picks.push({ sym, score: Math.min(100, Math.max(0, score)), reason: reasons.slice(0, 2).join(' · '), c });
+  }
+  Cache.autoPicks = picks.sort((a, b) => b.score - a.score);
+}
+
+// ── Lazy compute: hammer reversal signals ─────────────────────────────────────
+function computeHammers() {
+  const hammersList = [];
+  const symbols = S.symbols;
+  for (let si = 0; si < symbols.length; si++) {
+    const sym = symbols[si];
+    const history = Cache.histories[sym] || [];
+    const len = history.length;
+    if (len < 15) continue;
+
+    const priceArr = new Float64Array(len);
+    for (let i = 0; i < len; i++) priceArr[i] = history[i].price;
+
+    const isDown = new Uint8Array(len - 1);
+    for (let i = 0; i < len - 1; i++) isDown[i] = priceArr[i] > priceArr[i+1] ? 1 : 0;
+
+    let runningDownSum = 0;
+    for (let i = 0; i < 14; i++) runningDownSum += isDown[i];
+
+    for (let hammerIdx = 14; hammerIdx < len - 1; hammerIdx++) {
+      if (runningDownSum >= 12) {
+        const prevPrice = priceArr[hammerIdx-1];
+        const hammerPrice = priceArr[hammerIdx];
+        const nextPrice = priceArr[hammerIdx+1];
+
+        const open = prevPrice;
+        const close = hammerPrice;
+        const high = prevPrice > hammerPrice ? prevPrice : hammerPrice;
+        const low = prevPrice < hammerPrice ? prevPrice : hammerPrice;
+
+        const body = Math.abs(close-open) || (hammerPrice * 0.001);
+        const upperShadow = high - (open > close ? open : close);
+        const lowerShadow = (open < close ? open : close) - low;
+
+        if (upperShadow < body && lowerShadow > body && lowerShadow > (body * 0.5)) {
+          if (nextPrice > hammerPrice) {
+            const shadowRatio = lowerShadow / (upperShadow || 1);
+            const bodySmallness = Math.max(0, 1 - ((body / hammerPrice) * 100 / 2));
+            const strength = Math.min(100, Math.round((shadowRatio * 40) + (bodySmallness * 60)));
+
+            let score = 50;
+            score += (strength * 0.3);
+            if ((nextPrice - hammerPrice) / hammerPrice > 0.005) score += 15;
+            if (lowerShadow / high > 0.2) score += 10;
+            score = Math.min(100, Math.round(score));
+
+            if (score >= 50) {
+              hammersList.push({
+                sym,
+                ts: history[hammerIdx].ts,
+                label: history[hammerIdx].label,
+                price: hammerPrice,
+                entry: prevPrice,
+                nextPrice,
+                score,
+                strength,
+                reason: `15d downtrend, green confirmation`
+              });
+            }
+          }
+        }
+      }
+      runningDownSum = runningDownSum - isDown[hammerIdx - 14] + isDown[hammerIdx];
+    }
+  }
+  Cache.hammers = hammersList.sort((a, b) => b.score - a.score);
+}
+
+// ── Lazy compute: demand zones (Rally-Base-Rally) ─────────────────────────────
+function computeDemandZones() {
+  const zones = [];
+  const MAX_BASES = 4;
+  const BASE_PCT = 0.5;
+  const symbols = S.symbols;
+
+  for (let si = 0; si < symbols.length; si++) {
+    const sym = symbols[si];
+    const history = Cache.histories[sym] || [];
+    if (history.length < 5) continue;
+
+    const candles = [];
+    for (let i = 0; i < history.length; i++) {
+      const cur = history[i];
+      const prev = i > 0 ? history[i-1] : null;
+
+      let o, c, h, l, hasOHLC = false;
+      if (cur.ohlc) {
+        o = cur.ohlc.o; c = cur.ohlc.c;
+        h = cur.ohlc.h; l = cur.ohlc.l;
+        hasOHLC = true;
+      } else if (prev) {
+        o = prev.price; c = cur.price;
+        h = o > c ? o : c; l = o < c ? o : c;
+      } else {
+        candles.push(null); continue;
+      }
+
+      if (!isFinite(o) || !isFinite(c) || !isFinite(h) || !isFinite(l) ||
+          o <= 0 || c <= 0 || h <= 0 || l <= 0) {
+        candles.push(null); continue;
+      }
+
+      const body = Math.abs(c - o);
+      const range = h - l || 0.001;
+      const bodyRatio = body / range;
+      const ret = (c - o) / o * 100;
+      const isGreen = c >= o;
+
+      candles.push({ o, c, h, l, body, range, bodyRatio, ret, isGreen, hasOHLC, ts: cur.ts, label: cur.label });
+    }
+
+    const clen = candles.length;
+    if (clen < 5) continue;
+
+    let found = false;
+    for (let i = clen - 3; i >= 0 && !found; i--) {
+      const c1 = candles[i];
+      if (!c1) continue;
+      const c1IsRally = c1.hasOHLC ? (c1.isGreen && c1.bodyRatio >= 0.5) : (c1.isGreen);
+      if (!c1IsRally) continue;
+
+      let nb = 0;
+      for (let j = i + 1; j < Math.min(i + 1 + MAX_BASES, clen); j++) {
+        const b = candles[j];
+        if (!b) { nb = 0; break; }
+        const isBase = b.hasOHLC ? (b.bodyRatio < 0.5) : (Math.abs(b.ret) <= BASE_PCT);
+        if (isBase) nb++;
+        else break;
+      }
+      if (nb === 0) continue;
+
+      const r2Idx = i + 1 + nb;
+      if (r2Idx >= clen) continue;
+      const c2 = candles[r2Idx];
+      if (!c2) continue;
+      const c2IsRally = c2.hasOHLC ? (c2.isGreen && c2.bodyRatio >= 0.5) : (c2.isGreen);
+      if (!c2IsRally) continue;
+      if (c2.c <= c1.c) continue;
+
+      found = true;
+      let proximal = -Infinity, distal = Infinity;
+      for (let k = i + 1; k < r2Idx; k++) {
+        const bc = candles[k];
+        if (!bc) continue;
+        const bodyTop = bc.o > bc.c ? bc.o : bc.c;
+        if (bodyTop > proximal) proximal = bodyTop;
+        if (bc.l < distal) distal = bc.l;
+      }
+
+      let tested = false;
+      for (let k = r2Idx + 1; k < clen; k++) {
+        const cc = candles[k];
+        if (cc && cc.l <= proximal) { tested = true; break; }
+      }
+
+      const ltp = Cache.latestPrice[sym];
+      const notTested = ltp !== null && ltp > proximal * 1.02;
+
+      zones.push({
+        sym, ts: c2.ts, label: c2.label,
+        proximal: +proximal.toFixed(2), distal: +distal.toFixed(2),
+        rally1Close: +c1.c.toFixed(2), rally2Close: +c2.c.toFixed(2),
+        numBases: nb, tested, notTested,
+        distPct: ltp !== null ? +((ltp - proximal) / proximal * 100).toFixed(2) : null
+      });
+    }
+  }
+  Cache.demandZones = zones.sort((a, b) => {
+    if (a.notTested !== b.notTested) return a.notTested ? -1 : 1;
+    return b.ts - a.ts;
+  });
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────────
