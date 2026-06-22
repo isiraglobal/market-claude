@@ -192,8 +192,59 @@ function logStockPrices() {
   console.log(`[MarketAI EOD] Run in ${((Date.now()-startTime)/1000).toFixed(1)}s`);
 }
 
+// ─── INTRADAY OHLC COMPUTATION ────────────────────────────────────────────────
+// Reads all intraday snapshots for today and computes OPEN/HIGH/LOW/CLOSE per symbol.
+// This avoids relying on broken GOOGLEFINANCE "high"/"low" parameters.
+function getIntradayOHLCMap(marketSheet) {
+  const lastCol = marketSheet.getLastColumn();
+  const lastRow = marketSheet.getLastRow();
+  if (lastCol < 2 || lastRow < 2) return {};
+
+  const todayStr = getDayIST();
+  const headers = marketSheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
+
+  // Find columns with today's timestamps
+  const todayCols = [];
+  headers.forEach((h, idx) => {
+    if (!h) return;
+    const d = h instanceof Date ? h : new Date(h);
+    if (isNaN(d.getTime())) return;
+    const hdrStr = Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    if (hdrStr === todayStr) todayCols.push(idx + 1); // idx+1 = 1-indexed offset within the read range
+  });
+
+  if (todayCols.length === 0) return {};
+
+  // Read all data in one batch
+  const allData = marketSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const ohlcMap = {};
+  for (let r = 0; r < allData.length; r++) {
+    const sym = String(allData[r][0] || '').trim();
+    if (!sym) continue;
+
+    const prices = [];
+    for (let c = 0; c < todayCols.length; c++) {
+      const val = allData[r][todayCols[c]]; // todayCols[c] is 1-indexed offset (col A = 0)
+      if (val !== '' && !isNaN(val) && Number(val) > 0) prices.push(Number(val));
+    }
+
+    if (prices.length >= 2) {
+      let hi = prices[0], lo = prices[0];
+      for (let i = 1; i < prices.length; i++) {
+        if (prices[i] > hi) hi = prices[i];
+        if (prices[i] < lo) lo = prices[i];
+      }
+      ohlcMap[sym] = { open: prices[0], high: hi, low: lo, close: prices[prices.length - 1] };
+    } else if (prices.length === 1) {
+      ohlcMap[sym] = { open: prices[0], high: prices[0], low: prices[0], close: prices[0] };
+    }
+  }
+  return ohlcMap;
+}
+
 // ─── EXTRACT OHLC ─────────────────────────────────────────────────────────────
-function extractMarketData(allData, market) {
+function extractMarketData(allData, market, intradayOHLC) {
   const symIdx=0, cIdx=market.closeCol-1, oIdx=market.openCol-1, hIdx=market.highCol-1, lIdx=market.lowCol-1;
   const symbols=[], ohlcData=[];
 
@@ -203,17 +254,27 @@ function extractMarketData(allData, market) {
     if (!sym) continue;
 
     const closeStr = row.length > cIdx ? String(row[cIdx] || '').trim() : '';
-    const openStr  = row.length > oIdx ? String(row[oIdx] || '').trim() : '';
-    const highStr  = row.length > hIdx ? String(row[hIdx] || '').trim() : '';
-    const lowStr   = row.length > lIdx ? String(row[lIdx] || '').trim() : '';
-
     if (badValues.includes(closeStr)) continue;
     const close = Number(closeStr);
     if (isNaN(close) || close <= 0) continue;
 
-    const open  = (openStr && !badValues.includes(openStr))  ? Number(openStr)  : close;
-    const high  = (highStr && !badValues.includes(highStr))  ? Number(highStr)  : close;
-    const low   = (lowStr && !badValues.includes(lowStr))    ? Number(lowStr)   : close;
+    let open, high, low;
+
+    // For intraday markets, prefer OHLC computed from actual snapshots
+    const snap = intradayOHLC && intradayOHLC[sym];
+    if (snap) {
+      open  = snap.open;
+      high  = snap.high;
+      low   = snap.low;
+      close = snap.close;
+    } else {
+      const openStr = row.length > oIdx ? String(row[oIdx] || '').trim() : '';
+      const highStr = row.length > hIdx ? String(row[hIdx] || '').trim() : '';
+      const lowStr  = row.length > lIdx ? String(row[lIdx] || '').trim() : '';
+      open  = (openStr && !badValues.includes(openStr))  ? Number(openStr)  : close;
+      high  = (highStr && !badValues.includes(highStr))  ? Number(highStr)  : close;
+      low   = (lowStr  && !badValues.includes(lowStr))   ? Number(lowStr)   : close;
+    }
 
     const safe = v => isNaN(v) ? close : v;
     const ohlcStr = [close, safe(open), safe(high), safe(low)].map(v => v.toFixed(2)).join(',');
@@ -227,7 +288,9 @@ function processMarket(ss, market, allData, now) {
   const marketSheet = ss.getSheetByName(market.sheet);
   if (!marketSheet) return;
 
-  const { symbols, ohlcData } = extractMarketData(allData, market);
+  // For intraday markets, compute OHLC from actual snapshots (avoids broken GOOGLEFINANCE high/low)
+  const intradayOHLC = market.intraday ? getIntradayOHLCMap(marketSheet) : null;
+  const { symbols, ohlcData } = extractMarketData(allData, market, intradayOHLC);
   if (!symbols.length) { console.log(`[MarketAI] ${market.name}: No valid data`); return; }
 
   syncSymbolColumn(marketSheet, symbols);
