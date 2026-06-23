@@ -29,6 +29,8 @@ const CONFIG = {
   FIREBASE_SEND_MINUTE_IST:   0,
   RESET_HOUR_IST:             8,           // 8:00 AM IST
   RESET_MINUTE_IST:           0,
+  FIREBASE_BATCH_SIZE:        300,         // Number of symbols to upload in each run
+  FIREBASE_BATCH_DELAY_MINUTES: 30,         // Delay of 30 mins between batches
   MARKETS: [
     { name: 'NSE',    sheet: 'NSE',    prefix: 'NSE',    closeCol: 2,  openCol: 3,  highCol: 4,  lowCol: 5,  runAfterIST: '15:35', intraday: true  },
     { name: 'NASDAQ', sheet: 'NASDAQ', prefix: 'NASDAQ', closeCol: 6,  openCol: 7,  highCol: 8,  lowCol: 9,  runAfterIST: '02:35', intraday: false },
@@ -319,22 +321,44 @@ function captureIntradaySnapshot() {
 //   /stockIndex/master                      (symbol list)
 
 function sendToFirebase() {
-  const startTime = Date.now();
-  const nowIST    = getTimeIST();
-  const todayStr  = getDayIST();
+  const todayStr = getDayIST();
+  console.log(`[Firebase] Initializing batched upload for ${todayStr}...`);
 
   if (!isWeekday()) {
     console.log('[Firebase] Weekend — skipping Firebase upload');
     return;
   }
 
-  console.log(`[Firebase] Starting EOD upload for ${todayStr} at ${nowIST}`);
+  // Clear any leftover batch triggers to avoid duplicate runs
+  clearAllBatchTriggers();
 
-  const fb = getFirebaseConfig();
-  if (!fb.projectId || !fb.apiKey) {
-    console.error('[Firebase] FIREBASE_PROJECT_ID and FIREBASE_API_KEY must be set in Script Properties');
+  // Initialize batch state
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('FB_BATCH_OFFSET', '0');
+  props.setProperty('FB_BATCH_DATE', todayStr);
+
+  // Execute the first batch immediately
+  executeFirebaseBatch();
+}
+
+/**
+ * Executes a single batch upload of stock data.
+ */
+function executeFirebaseBatch() {
+  const startTime = Date.now();
+  const todayStr  = getDayIST();
+  const props     = PropertiesService.getScriptProperties();
+
+  const batchDate = props.getProperty('FB_BATCH_DATE');
+  if (batchDate !== todayStr) {
+    console.warn(`[Firebase] Batch run ignored. Date mismatch (batchDate: ${batchDate}, today: ${todayStr}).`);
     return;
   }
+
+  let offset = Number(props.getProperty('FB_BATCH_OFFSET') || '0');
+  const BATCH_SIZE = CONFIG.FIREBASE_BATCH_SIZE;
+
+  console.log(`[Firebase] Starting batch upload: Offset ${offset}, Batch Size ${BATCH_SIZE}`);
 
   const ss       = SpreadsheetApp.getActiveSpreadsheet();
   const nseSheet = ss.getSheetByName(CONFIG.NSE_SHEET);
@@ -348,9 +372,9 @@ function sendToFirebase() {
   }
 
   // Read header row to find today's columns
-  const headers    = nseSheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
-  const todayCols  = [];  // 0-indexed within headers array (col B = headers[0])
-  const colTsMap   = {};  // col-offset → timestamp ms
+  const headers   = nseSheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
+  const todayCols = [];  // 0-indexed within headers array (col B = headers[0])
+  const colTsMap  = {};  // col-offset → timestamp ms
 
   headers.forEach((h, idx) => {
     if (!h) return;
@@ -368,56 +392,54 @@ function sendToFirebase() {
     return;
   }
 
-  console.log(`[Firebase] Found ${todayCols.length} minute snapshots for ${todayStr}`);
-
-  // Read all data (symbols + today's columns only)
-  // We batch-read to stay within Sheets API limits
+  // Read all symbols
   const symValues  = nseSheet.getRange(2, 1, lastRow - 1, 1).getValues().map(r => String(r[0] || '').trim());
   const allSymbols = symValues.filter(Boolean);
 
-  // Build per-symbol minute bars { [sym]: [{ts, price}, ...] }
-  const symbolBars  = {};
-  const CHUNK_SIZE  = 500; // read this many rows at a time
+  if (offset >= allSymbols.length) {
+    console.log(`[Firebase] All symbols already uploaded (${allSymbols.length}). Finished.`);
+    return;
+  }
 
-  for (let rowStart = 0; rowStart < allSymbols.length; rowStart += CHUNK_SIZE) {
-    const chunkSyms = allSymbols.slice(rowStart, rowStart + CHUNK_SIZE);
-    const rowCount  = chunkSyms.length;
+  const batchSymbols = allSymbols.slice(offset, offset + BATCH_SIZE);
+  console.log(`[Firebase] Processing symbols ${offset} to ${offset + batchSymbols.length} of ${allSymbols.length}`);
 
-    // Read all today's columns for this chunk of rows
-    // nseSheet row 2 = allSymbols[0], so sheet row = rowStart + 2
-    const data = nseSheet.getRange(rowStart + 2, 2, rowCount, lastCol - 1).getValues();
+  // Build per-symbol minute bars for this batch
+  const symbolBars = {};
+  
+  // Read today's columns for only this batch slice (rowStart = offset + 2)
+  const data = nseSheet.getRange(offset + 2, 2, batchSymbols.length, lastCol - 1).getValues();
 
-    for (let r = 0; r < chunkSyms.length; r++) {
-      const sym = chunkSyms[r];
-      if (!sym) continue;
-      const bars = [];
-      for (const colOffset of todayCols) {
-        const val = data[r][colOffset];
-        if (val !== '' && !isNaN(val) && Number(val) > 0) {
-          bars.push({ ts: colTsMap[colOffset], price: Number(val) });
-        }
+  for (let r = 0; r < batchSymbols.length; r++) {
+    const sym = batchSymbols[r];
+    if (!sym) continue;
+    const bars = [];
+    for (const colOffset of todayCols) {
+      const val = data[r][colOffset];
+      if (val !== '' && !isNaN(val) && Number(val) > 0) {
+        bars.push({ ts: colTsMap[colOffset], price: Number(val) });
       }
-      if (bars.length > 0) symbolBars[sym] = bars;
     }
+    if (bars.length > 0) symbolBars[sym] = bars;
   }
 
   const symbols = Object.keys(symbolBars);
-  console.log(`[Firebase] Building payloads for ${symbols.length} symbols`);
+  console.log(`[Firebase] Building payloads for ${symbols.length} symbols in this batch`);
 
-  // Prepare Firestore batch writes (max 500 per batch)
-  const BATCH_LIMIT = 400; // Stay under 500 Firestore limit
-  let   writes      = [];
-  let   batchCount  = 0;
-  let   writeCount  = 0;
+  const fb = getFirebaseConfig();
+  let writes = [];
+  let writeCount = 0;
+  let batchCount = 0;
 
   function flushBatch() {
     if (writes.length === 0) return;
     const ok = firestoreBatchWrite(writes);
-    console.log(`[Firebase] Batch ${++batchCount}: ${writes.length} writes → ${ok ? 'OK' : 'FAIL'}`);
+    console.log(`[Firebase] REST Batch ${++batchCount}: ${writes.length} writes → ${ok ? 'OK' : 'FAIL'}`);
     writes = [];
   }
 
   // 1. Per-symbol daily document: historicalData/{date}/stocks/{symbol}
+  // Large payloads: flush every 100 documents to avoid REST payload limits (10MB)
   for (const sym of symbols) {
     const bars  = symbolBars[sym];
     const prices = bars.map(b => b.price);
@@ -426,7 +448,7 @@ function sendToFirebase() {
     let   high   = open, low = open;
     for (const p of prices) { if (p > high) high = p; if (p < low) low = p; }
 
-    const fields = {
+    writes.push(buildFirestoreWrite(`historicalData/${todayStr}/stocks/${sym}`, {
       symbol:        sym,
       date:          todayStr,
       open:          open,
@@ -435,16 +457,16 @@ function sendToFirebase() {
       close:         close,
       snapshotCount: bars.length,
       syncedAt:      Date.now(),
-      minuteBars:    bars,  // array of {ts, price}
-    };
-
-    writes.push(buildFirestoreWrite(`historicalData/${todayStr}/stocks/${sym}`, fields, fb));
+      minuteBars:    bars,
+    }, fb));
     writeCount++;
 
-    if (writes.length >= BATCH_LIMIT) flushBatch();
+    if (writes.length >= 100) flushBatch();
   }
+  flushBatch(); // flush remaining historical docs
 
   // 2. Latest price index: stocks/{symbol}
+  // Light payloads: flush every 400 documents
   for (const sym of symbols) {
     const bars   = symbolBars[sym];
     const prices = bars.map(b => b.price);
@@ -464,31 +486,97 @@ function sendToFirebase() {
     }, fb));
     writeCount++;
 
-    if (writes.length >= BATCH_LIMIT) flushBatch();
+    if (writes.length >= 400) flushBatch();
   }
+  flushBatch(); // flush remaining latest docs
 
-  // 3. Stock index (master symbol list)
-  writes.push(buildFirestoreWrite('stockIndex/master', {
-    symbols:     symbols,
-    count:       symbols.length,
-    lastUpdated: Date.now(),
-    lastDate:    todayStr,
-  }, fb));
-  writeCount++;
-
-  // 4. Day metadata
-  writes.push(buildFirestoreWrite(`intradaySnapshots/${todayStr}/metadata`, {
-    date:          todayStr,
-    snapshotCount: todayCols.length,
-    symbolCount:   symbols.length,
-    syncedAt:      Date.now(),
-  }, fb));
-  writeCount++;
-
-  flushBatch(); // flush remaining
+  // Update offset in Script Properties
+  const nextOffset = offset + BATCH_SIZE;
+  props.setProperty('FB_BATCH_OFFSET', String(nextOffset));
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[Firebase] Upload complete: ${writeCount} docs, ${batchCount} batches, ${symbols.length} symbols in ${elapsed}s`);
+  console.log(`[Firebase] Batch run complete. ${writeCount} docs processed in ${elapsed}s`);
+
+  // Check if we need to schedule the next batch
+  if (nextOffset < allSymbols.length) {
+    console.log(`[Firebase] Scheduling next batch (Offset: ${nextOffset}) in ${CONFIG.FIREBASE_BATCH_DELAY_MINUTES} minutes...`);
+    ScriptApp.newTrigger('sendToFirebaseBatch')
+      .timeBased()
+      .after(CONFIG.FIREBASE_BATCH_DELAY_MINUTES * 60 * 1000)
+      .create();
+  } else {
+    console.log(`[Firebase] All batches finished! Finalizing...`);
+    
+    // Finalize master index
+    pushSymbolIndexToFirebase();
+
+    // Day metadata
+    const metaWrites = [
+      buildFirestoreWrite(`intradaySnapshots/${todayStr}/metadata`, {
+        date:          todayStr,
+        snapshotCount: todayCols.length,
+        symbolCount:   allSymbols.length,
+        syncedAt:      Date.now(),
+      }, fb)
+    ];
+    firestoreBatchWrite(metaWrites);
+
+    // Clean up properties
+    props.deleteProperty('FB_BATCH_OFFSET');
+    props.deleteProperty('FB_BATCH_DATE');
+    console.log(`[Firebase] Batched upload fully completed for today.`);
+  }
+}
+
+/**
+ * Trigger handler for subsequent batches.
+ * Deletes itself to prevent accumulation, then runs the next batch.
+ */
+function sendToFirebaseBatch(e) {
+  if (e && e.triggerUid) {
+    deleteTriggerById(e.triggerUid);
+  }
+  executeFirebaseBatch();
+}
+
+/**
+ * Deletes a trigger by its unique ID.
+ */
+function deleteTriggerById(id) {
+  if (!id) return;
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    for (const t of triggers) {
+      if (t.getUniqueId() === id) {
+        ScriptApp.deleteTrigger(t);
+        console.log(`[Firebase] Successfully deleted temporary trigger: ${id}`);
+        break;
+      }
+    }
+  } catch (err) {
+    console.error(`[Firebase] Failed to delete trigger ${id}: ${err.message}`);
+  }
+}
+
+/**
+ * Clears all temporary batch triggers.
+ */
+function clearAllBatchTriggers() {
+  try {
+    const triggers = ScriptApp.getProjectTriggers();
+    let count = 0;
+    for (const t of triggers) {
+      if (t.getHandlerFunction() === 'sendToFirebaseBatch') {
+        ScriptApp.deleteTrigger(t);
+        count++;
+      }
+    }
+    if (count > 0) {
+      console.log(`[Firebase] Cleared ${count} leftover batch trigger(s)`);
+    }
+  } catch (err) {
+    console.error(`[Firebase] Error clearing batch triggers: ${err.message}`);
+  }
 }
 
 // ─── RESET SHEET (8:00 AM IST trigger) ───────────────────────────────────────
