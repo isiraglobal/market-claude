@@ -1093,18 +1093,7 @@ function fullSetup() {
     log.push(`✗ Snapshot error: ${e.message}`);
   }
 
-  // ── Step 4: Push current state to Firebase ────────────────────────────────
-  try {
-    const fb = getFirebaseConfig();
-    if (fb.projectId && fb.apiKey) {
-      pushSymbolIndexToFirebase();
-      log.push(`✓ Symbol index pushed to Firebase (project: ${fb.projectId})`);
-    } else {
-      log.push('⚠ Firebase not configured — skipping push');
-    }
-  } catch (e) {
-    log.push(`✗ Firebase push error: ${e.message}`);
-  }
+
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   log.push(`\n⏱ Completed in ${elapsed}s`);
