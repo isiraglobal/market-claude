@@ -1075,17 +1075,7 @@ function fullSetup() {
     log.push(`✗ Trigger setup error: ${e.message}`);
   }
 
-  // ── Step 3: Immediate snapshot if market is open ──────────────────────────
-  try {
-    if (isWeekday() && isMarketHours()) {
-      captureIntradaySnapshot();
-      log.push(`✓ Immediate snapshot captured (market is open: ${getTimeIST()})`);
-    } else {
-      log.push(`ℹ Market closed (${getTimeIST()} IST) — snapshot will run automatically at 9:15 AM`);
-    }
-  } catch (e) {
-    log.push(`✗ Snapshot error: ${e.message}`);
-  }
+
 
 
 
