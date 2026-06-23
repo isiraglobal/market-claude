@@ -1033,20 +1033,282 @@ function forceSimulateData() {
   simulateMinuteData();
 }
 
+// ─── FULL SETUP (run this once — does everything) ─────────────────────────────
+//
+// This is the SINGLE function to run when setting up the system fresh.
+// It will:
+//  1. Create all market sheets and add GOOGLEFINANCE formulas
+//  2. Delete all existing triggers and set up all new ones
+//  3. Capture an immediate intraday snapshot (if market is open)
+//  4. Push current data to Firebase
+//  5. Show a summary of what was done
+
+function fullSetup() {
+  const ui        = SpreadsheetApp.getUi();
+  const log       = [];
+  const startTime = Date.now();
+
+  log.push('🚀 MarketAI Full Setup Starting...\n');
+
+  // ── Step 1: Create market sheets + GOOGLEFINANCE formulas ─────────────────
+  try {
+    const ss           = SpreadsheetApp.getActiveSpreadsheet();
+    const symbolsSheet = ss.getSheetByName(CONFIG.SYMBOLS_SHEET);
+
+    if (symbolsSheet) {
+      const hdrLabels = ['SYMBOL'];
+      CONFIG.MARKETS.forEach(m => {
+        hdrLabels.push(m.name, m.name + '_OPEN', m.name + '_HIGH', m.name + '_LOW');
+      });
+      const hdrRange = symbolsSheet.getRange(1, 1, 1, hdrLabels.length);
+      hdrRange.setValues([hdrLabels]).setFontWeight('bold');
+
+      const lastRow = symbolsSheet.getLastRow();
+      if (lastRow > 1) {
+        const symValues = symbolsSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+        CONFIG.MARKETS.forEach(market => {
+          ['price', 'open', 'high', 'low'].forEach((ft, fi) => {
+            const col      = market.closeCol + fi;
+            const formulas = symValues.map((r, ri) => {
+              const sym = String(r[0] || '').trim();
+              return sym ? [`=IF(A${ri + 2}="","",GOOGLEFINANCE("${market.prefix}:"&A${ri + 2},"${ft}"))`] : [''];
+            });
+            symbolsSheet.getRange(2, col, formulas.length, 1).setFormulas(formulas);
+          });
+        });
+        log.push(`✓ SYMBOLS sheet: GOOGLEFINANCE formulas set for ${lastRow - 1} symbols`);
+      } else {
+        log.push('⚠ SYMBOLS sheet has no symbols in column A — add your stock symbols first!');
+      }
+    } else {
+      log.push('⚠ SYMBOLS sheet not found — please create it with stock symbols in column A');
+    }
+
+    // Create market sheets if missing
+    let sheetsCreated = 0;
+    CONFIG.MARKETS.forEach(market => {
+      if (!ss.getSheetByName(market.sheet)) {
+        const sheet = ss.insertSheet(market.sheet);
+        sheet.getRange(1, 1).setValue('Symbol').setFontWeight('bold');
+        sheetsCreated++;
+      }
+    });
+    if (sheetsCreated > 0) log.push(`✓ Created ${sheetsCreated} new market sheet(s)`);
+    else log.push('✓ All market sheets already exist');
+
+  } catch (e) {
+    log.push(`✗ Sheet setup error: ${e.message}`);
+  }
+
+  // ── Step 2: Delete all triggers → set up fresh ────────────────────────────
+  try {
+    const existing = ScriptApp.getProjectTriggers();
+    existing.forEach(t => ScriptApp.deleteTrigger(t));
+    log.push(`✓ Cleared ${existing.length} old trigger(s)`);
+
+    // Per-minute intraday
+    ScriptApp.newTrigger('captureIntradaySnapshot').timeBased()
+      .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES).create();
+
+    // Firebase upload at 4 PM IST
+    ScriptApp.newTrigger('sendToFirebase').timeBased()
+      .atHour(CONFIG.FIREBASE_SEND_HOUR_IST).nearMinute(CONFIG.FIREBASE_SEND_MINUTE_IST)
+      .everyDays(1).create();
+
+    // Sheet reset at 8 AM IST
+    ScriptApp.newTrigger('resetSheet').timeBased()
+      .atHour(CONFIG.RESET_HOUR_IST).nearMinute(CONFIG.RESET_MINUTE_IST)
+      .everyDays(1).create();
+
+    // EOD triggers
+    [{h:11,m:40},{h:12,m:10},{h:13,m:40},{h:15,m:40},{h:21,m:10},{h:2,m:40}].forEach(t => {
+      ScriptApp.newTrigger('logStockPrices').timeBased()
+        .atHour(t.h).nearMinute(t.m).everyDays(1).create();
+    });
+
+    // Daily cleanup
+    ScriptApp.newTrigger('dailyCleanup').timeBased()
+      .atHour(0).nearMinute(30).everyDays(1).create();
+
+    log.push('✓ Triggers set: 1-min capture | 4PM Firebase | 8AM reset | EOD | cleanup');
+  } catch (e) {
+    log.push(`✗ Trigger setup error: ${e.message}`);
+  }
+
+  // ── Step 3: Immediate snapshot if market is open ──────────────────────────
+  try {
+    if (isWeekday() && isMarketHours()) {
+      captureIntradaySnapshot();
+      log.push(`✓ Immediate snapshot captured (market is open: ${getTimeIST()})`);
+    } else {
+      log.push(`ℹ Market closed (${getTimeIST()} IST) — snapshot will run automatically at 9:15 AM`);
+    }
+  } catch (e) {
+    log.push(`✗ Snapshot error: ${e.message}`);
+  }
+
+  // ── Step 4: Push current state to Firebase ────────────────────────────────
+  try {
+    const fb = getFirebaseConfig();
+    if (fb.projectId && fb.apiKey) {
+      pushSymbolIndexToFirebase();
+      log.push(`✓ Symbol index pushed to Firebase (project: ${fb.projectId})`);
+    } else {
+      log.push('⚠ Firebase not configured — skipping push');
+    }
+  } catch (e) {
+    log.push(`✗ Firebase push error: ${e.message}`);
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  log.push(`\n⏱ Completed in ${elapsed}s`);
+
+  ui.alert(
+    '✅ MarketAI — Full Setup Complete',
+    log.join('\n'),
+    ui.ButtonSet.OK
+  );
+}
+
+// ─── PUSH SYMBOL INDEX TO FIREBASE ───────────────────────────────────────────
+// Writes the master symbol list to /stockIndex/master in Firestore.
+// Called by fullSetup() and can also be run standalone.
+
+function pushSymbolIndexToFirebase() {
+  const fb = getFirebaseConfig();
+  if (!fb.projectId || !fb.apiKey) return;
+
+  const ss           = SpreadsheetApp.getActiveSpreadsheet();
+  const symbolsSheet = ss.getSheetByName(CONFIG.SYMBOLS_SHEET);
+  if (!symbolsSheet || symbolsSheet.getLastRow() < 2) return;
+
+  const symbols = symbolsSheet.getRange(2, 1, symbolsSheet.getLastRow() - 1, 1)
+    .getValues().map(r => String(r[0] || '').trim()).filter(Boolean);
+
+  const path = `stockIndex/master`;
+  firestoreSet(path, {
+    symbols:     symbols,
+    count:       symbols.length,
+    lastUpdated: Date.now(),
+    lastDate:    getDayIST(),
+  });
+  console.log(`[Firebase] Symbol index pushed: ${symbols.length} symbols`);
+}
+
+// ─── FETCH TODAY'S DATA FROM SHEETS (for API / web-app use) ──────────────────
+// Returns the latest per-minute prices from the NSE sheet for TODAY only.
+// Used by the dashboard to get live intraday data.
+
+function getTodayDataFromSheets() {
+  const ss       = SpreadsheetApp.getActiveSpreadsheet();
+  const nseSheet = ss.getSheetByName(CONFIG.NSE_SHEET);
+  if (!nseSheet || nseSheet.getLastColumn() < 2) return { date: getDayIST(), snapshots: [], symbols: [] };
+
+  const todayStr = getDayIST();
+  const lastCol  = nseSheet.getLastColumn();
+  const lastRow  = nseSheet.getLastRow();
+  const headers  = nseSheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
+
+  // Find today's columns
+  const todayCols = [];
+  const colTs     = {};
+  const colLabels = {};
+  headers.forEach((h, idx) => {
+    if (!h) return;
+    const d = h instanceof Date ? h : new Date(h);
+    if (isNaN(d.getTime())) return;
+    const dayStr = Utilities.formatDate(d, CONFIG.TIMEZONE, 'yyyy-MM-dd');
+    if (dayStr === todayStr) {
+      todayCols.push(idx);
+      colTs[idx]     = d.getTime();
+      colLabels[idx] = Utilities.formatDate(d, CONFIG.TIMEZONE, 'HH:mm');
+    }
+  });
+
+  if (todayCols.length === 0) return { date: todayStr, snapshots: [], symbols: [] };
+
+  // Read all symbols
+  const symValues = nseSheet.getRange(2, 1, lastRow - 1, 1).getValues()
+    .map(r => String(r[0] || '').trim());
+  const symbols   = symValues.filter(Boolean);
+
+  // Build snapshots: [{ts, label, prices: {SYM: price}}]
+  const snapshots = todayCols.map(colIdx => ({ ts: colTs[colIdx], label: colLabels[colIdx], prices: {} }));
+
+  // Read all today's price data in one batch
+  const allData = nseSheet.getRange(2, 2, lastRow - 1, lastCol - 1).getValues();
+  for (let r = 0; r < symValues.length; r++) {
+    const sym = symValues[r];
+    if (!sym) continue;
+    for (let i = 0; i < todayCols.length; i++) {
+      const val = allData[r][todayCols[i]];
+      if (val !== '' && !isNaN(val) && Number(val) > 0) {
+        snapshots[i].prices[sym] = Number(val);
+      }
+    }
+  }
+
+  return {
+    date:      todayStr,
+    snapshots: snapshots.filter(s => Object.keys(s.prices).length > 0),
+    symbols,
+  };
+}
+
+// ─── doGet — Web App endpoint (optional, deploy as web app for API access) ────
+// Deploy this script as a Web App (Execute as: Me, Who has access: Anyone)
+// Then your frontend can call:
+//   GET <webapp-url>?action=today   → today's Sheets data (live)
+//   GET <webapp-url>?action=ping    → health check
+//
+// Historical data comes directly from Firebase via /api/firebase on Vercel.
+
+function doGet(e) {
+  const action = (e && e.parameter && e.parameter.action) || 'ping';
+
+  if (action === 'ping') {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok:        true,
+      time:      getNowISTStr(),
+      marketOpen: isMarketHours() && isWeekday(),
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  if (action === 'today') {
+    try {
+      const data = getTodayDataFromSheets();
+      return ContentService.createTextOutput(JSON.stringify({
+        ok:   true,
+        data,
+      })).setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: false, error: err.message,
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({
+    ok: false, error: 'Unknown action. Use: ping, today',
+  })).setMimeType(ContentService.MimeType.JSON);
+}
+
 // ─── MENU ─────────────────────────────────────────────────────────────────────
 
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('MarketAI')
-    .addItem('1. Create Market Sheets',      'setupMarketSheets')
-    .addItem('2. Setup Firebase Credentials','setupFirebaseCredentials')
-    .addItem('3. Setup All Triggers',        'setupTriggers')
+    .addItem('🚀 Full Setup (Run This First!)', 'fullSetup')
     .addSeparator()
-    .addItem('📊 Simulate Data (Testing)',   'forceSimulateData')
+    .addItem('📊 Simulate Data (Testing)',      'forceSimulateData')
     .addSeparator()
-    .addItem('Force Snapshot Now',           'forceSnapshotNow')
-    .addItem('Force Firebase Upload Now',    'forceFirebaseUploadNow')
-    .addItem('Force Sheet Reset Now',        'forceResetSheetNow')
-    .addItem('Force EOD Cleanup Now',        'forceCleanupNow')
+    .addItem('Force Snapshot Now',              'forceSnapshotNow')
+    .addItem('Force Firebase Upload Now',       'forceFirebaseUploadNow')
+    .addItem('Force Sheet Reset Now',           'forceResetSheetNow')
+    .addItem('Force EOD Cleanup Now',           'forceCleanupNow')
+    .addSeparator()
+    .addItem('Advanced: Setup Sheets Only',     'setupMarketSheets')
+    .addItem('Advanced: Setup Triggers Only',   'setupTriggers')
+    .addItem('Advanced: Push Symbol Index',     'pushSymbolIndexToFirebase')
     .addToUi();
 }
