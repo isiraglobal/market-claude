@@ -1001,65 +1001,7 @@ function fullSetup() {
 
   log.push('🚀 MarketAI Full Setup Starting...\n');
 
-  // ── Step 1: Create market sheets + GOOGLEFINANCE formulas ─────────────────
-  try {
-    const ss           = SpreadsheetApp.getActiveSpreadsheet();
-    const symbolsSheet = ss.getSheetByName(CONFIG.SYMBOLS_SHEET);
 
-    if (symbolsSheet) {
-      const hdrLabels = ['SYMBOL'];
-      CONFIG.MARKETS.forEach(m => {
-        hdrLabels.push(m.name, m.name + '_OPEN', m.name + '_HIGH', m.name + '_LOW');
-      });
-      const hdrRange = symbolsSheet.getRange(1, 1, 1, hdrLabels.length);
-      hdrRange.setValues([hdrLabels]).setFontWeight('bold');
-
-      log.push('✓ SYMBOLS sheet: Headers configured');
-
-      const lastRow = symbolsSheet.getLastRow();
-      if (lastRow > 1) {
-        // Clear all foreign exchange and daily OHLC formulas from Col C (3) onwards
-        // to prevent sheet from recalculating 57,000+ useless formulas and freezing.
-        const lastCol = symbolsSheet.getLastColumn();
-        if (lastCol > 2) {
-          symbolsSheet.getRange(2, 3, lastRow - 1, lastCol - 2).clearContent();
-          log.push('✓ SYMBOLS sheet: Cleared foreign market formulas to prevent spreadsheet freeze');
-        }
-
-        // Initialize Col B (NSE price) formulas only if they are missing
-        const hasFormulas = symbolsSheet.getRange(2, 2).getFormula();
-        if (!hasFormulas) {
-          const symValues = symbolsSheet.getRange(2, 1, lastRow - 1, 1).getValues();
-          const nseFormulas = symValues.map((r, ri) => {
-            const rowNum = ri + 2;
-            const sym = String(r[0] || '').trim();
-            return sym ? [`=IF(A${rowNum}="","",GOOGLEFINANCE("NSE:"&A${rowNum},"price"))`] : [''];
-          });
-          symbolsSheet.getRange(2, 2, nseFormulas.length, 1).setFormulas(nseFormulas);
-          log.push(`✓ SYMBOLS sheet: NSE price formulas set for ${lastRow - 1} symbols`);
-        } else {
-          log.push('✓ SYMBOLS sheet: NSE price formulas already exist');
-        }
-      }
-    } else {
-      log.push('⚠ SYMBOLS sheet not found — please create it with stock symbols in column A');
-    }
-
-    // Create market sheets if missing
-    let sheetsCreated = 0;
-    CONFIG.MARKETS.forEach(market => {
-      if (!ss.getSheetByName(market.sheet)) {
-        const sheet = ss.insertSheet(market.sheet);
-        sheet.getRange(1, 1).setValue('Symbol').setFontWeight('bold');
-        sheetsCreated++;
-      }
-    });
-    if (sheetsCreated > 0) log.push(`✓ Created ${sheetsCreated} new market sheet(s)`);
-    else log.push('✓ All market sheets already exist');
-
-  } catch (e) {
-    log.push(`✗ Sheet setup error: ${e.message}`);
-  }
 
   // ── Step 2: Delete all triggers → set up fresh ────────────────────────────
   try {
