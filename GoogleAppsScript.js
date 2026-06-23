@@ -107,12 +107,19 @@ function hasWrittenToday(marketSheet) {
 }
 
 // ─── FIREBASE HELPERS ────────────────────────────────────────────────────────
+// Auto-configured from Firebase CLI (project: argen0, db: default, region: eur3)
+
+const FIREBASE_PROJECT_ID = 'argen0';
+const FIREBASE_API_KEY    = 'AIzaSyBv3vXMpMWhm3Y672LyAyrsjtO8edvXVp0';
+const FIREBASE_DB_NAME    = 'default'; // database is named 'default' (not '(default)')
 
 function getFirebaseConfig() {
+  // Script Properties can override these defaults at runtime
   const props = PropertiesService.getScriptProperties();
   return {
-    projectId: props.getProperty('FIREBASE_PROJECT_ID') || '',
-    apiKey:    props.getProperty('FIREBASE_API_KEY')    || '',
+    projectId: props.getProperty('FIREBASE_PROJECT_ID') || FIREBASE_PROJECT_ID,
+    apiKey:    props.getProperty('FIREBASE_API_KEY')    || FIREBASE_API_KEY,
+    dbName:    props.getProperty('FIREBASE_DB_NAME')    || FIREBASE_DB_NAME,
     authToken: props.getProperty('FIREBASE_AUTH_TOKEN') || '',
   };
 }
@@ -128,7 +135,7 @@ function firestoreSet(path, fields) {
     return false;
   }
 
-  const url = `https://firestore.googleapis.com/v1/projects/${fb.projectId}/databases/(default)/documents/${path}?key=${fb.apiKey}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${fb.projectId}/databases/${fb.dbName}/documents/${path}?key=${fb.apiKey}`;
 
   const payload = { fields: toFirestoreFields(fields) };
   const options = {
@@ -194,7 +201,7 @@ function firestoreBatchWrite(writes) {
   const fb = getFirebaseConfig();
   if (!fb.projectId || !fb.apiKey) return false;
 
-  const url     = `https://firestore.googleapis.com/v1/projects/${fb.projectId}/databases/(default)/documents:batchWrite?key=${fb.apiKey}`;
+  const url     = `https://firestore.googleapis.com/v1/projects/${fb.projectId}/databases/${fb.dbName}/documents:batchWrite?key=${fb.apiKey}`;
   const options = {
     method:             'POST',
     contentType:        'application/json',
@@ -221,7 +228,7 @@ function firestoreBatchWrite(writes) {
 function buildFirestoreWrite(path, fields, fb) {
   return {
     update: {
-      name:   `projects/${fb.projectId}/databases/(default)/documents/${path}`,
+      name:   `projects/${fb.projectId}/databases/${fb.dbName}/documents/${path}`,
       fields: toFirestoreFields(fields),
     },
   };

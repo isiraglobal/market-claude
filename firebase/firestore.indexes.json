@@ -22,6 +22,22 @@
         { "fieldPath": "symbol",      "order": "ASCENDING"  },
         { "fieldPath": "lastUpdated", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "stocks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "todayDate",   "order": "ASCENDING"  },
+        { "fieldPath": "symbol",      "order": "ASCENDING"  }
+      ]
+    },
+    {
+      "collectionGroup": "stocks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "todayDate",   "order": "ASCENDING"  },
+        { "fieldPath": "todayClose",  "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

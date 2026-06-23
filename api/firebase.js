@@ -34,7 +34,7 @@ const CORS_HEADERS = {
 
 function firestoreRequest(method, path, body = null) {
   return new Promise((resolve, reject) => {
-    const baseUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+    const baseUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/default/documents`;
     const fullUrl = `${baseUrl}/${path}${FIREBASE_API_KEY ? `?key=${FIREBASE_API_KEY}` : ''}`;
     const parsed  = new URL(fullUrl);
 
@@ -124,7 +124,7 @@ async function listDocuments(collectionPath, pageSize = 300) {
 
 async function batchWrite(writes) {
   if (!FIREBASE_PROJECT_ID) return false;
-  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FIREBASE_API_KEY}`;
+  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/default/documents:batchWrite?key=${FIREBASE_API_KEY}`;
   const res = await new Promise((resolve, reject) => {
     const bodyStr = JSON.stringify({ writes });
     const parsed  = new URL(url);
@@ -311,7 +311,7 @@ module.exports = async (req, res) => {
 
       try {
         const writes    = [];
-        const base      = `projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
+        const base      = `projects/${FIREBASE_PROJECT_ID}/databases/default/documents`;
 
         for (const sd of symbolData) {
           const { symbol, open, high, low, close, minuteBars = [] } = sd;

@@ -33,7 +33,7 @@ async function pushLatestToFirebase(pool) {
   if (symbols.length === 0) return false;
 
   const dateStr   = new Date(latest.ts).toISOString().slice(0, 10);
-  const baseDocPath = `projects/${FB_PROJECT_ID}/databases/(default)/documents`;
+  const baseDocPath = `projects/${FB_PROJECT_ID}/databases/default/documents`;
 
   function toFbValue(val) {
     if (val === null || val === undefined) return { nullValue: null };
@@ -58,7 +58,7 @@ async function pushLatestToFirebase(pool) {
 
   async function flush() {
     if (writes.length === 0) return;
-    const url     = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FB_API_KEY}`;
+    const url     = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT_ID}/databases/default/documents:batchWrite?key=${FB_API_KEY}`;
     const bodyStr = JSON.stringify({ writes });
     const parsed  = new URL(url);
 
