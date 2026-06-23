@@ -1014,41 +1014,7 @@ function fullSetup() {
       const hdrRange = symbolsSheet.getRange(1, 1, 1, hdrLabels.length);
       hdrRange.setValues([hdrLabels]).setFontWeight('bold');
 
-      const lastRow = symbolsSheet.getLastRow();
-      if (lastRow > 1) {
-        // Skip formula writing if already initialized
-        const hasFormulas = symbolsSheet.getRange(2, 2).getFormula();
-        if (!hasFormulas) {
-          const symValues  = symbolsSheet.getRange(2, 1, lastRow - 1, 1).getValues();
-          const numCols    = hdrLabels.length - 1;
-          const formulas2D = [];
-
-          for (let ri = 0; ri < symValues.length; ri++) {
-            const rowNum = ri + 2;
-            const sym = String(symValues[ri][0] || '').trim();
-            const rowFormulas = [];
-
-            if (!sym) {
-              for (let c = 0; c < numCols; c++) rowFormulas.push('');
-            } else {
-              CONFIG.MARKETS.forEach(market => {
-                rowFormulas.push(`=IF(A${rowNum}="","",GOOGLEFINANCE("${market.prefix}:"&A${rowNum},"price"))`);
-                rowFormulas.push(`=IF(A${rowNum}="","",GOOGLEFINANCE("${market.prefix}:"&A${rowNum},"open"))`);
-                rowFormulas.push(`=IF(A${rowNum}="","",GOOGLEFINANCE("${market.prefix}:"&A${rowNum},"high"))`);
-                rowFormulas.push(`=IF(A${rowNum}="","",GOOGLEFINANCE("${market.prefix}:"&A${rowNum},"low"))`);
-              });
-            }
-            formulas2D.push(rowFormulas);
-          }
-
-          symbolsSheet.getRange(2, 2, formulas2D.length, numCols).setFormulas(formulas2D);
-          log.push(`✓ SYMBOLS sheet: GOOGLEFINANCE formulas initialized for ${lastRow - 1} symbols`);
-        } else {
-          log.push('✓ SYMBOLS sheet: Formulas already initialized — skipping overwrite');
-        }
-      } else {
-        log.push('⚠ SYMBOLS sheet has no symbols in column A — add your stock symbols first!');
-      }
+      log.push('✓ SYMBOLS sheet: Headers configured');
     } else {
       log.push('⚠ SYMBOLS sheet not found — please create it with stock symbols in column A');
     }
