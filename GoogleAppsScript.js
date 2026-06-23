@@ -613,126 +613,7 @@ function resetSheet() {
   SpreadsheetApp.flush();
 }
 
-// ─── SIMULATE PER-MINUTE DATA (testing) ─────────────────────────────────────
-//
-// Populates NSE sheet with realistic simulated per-minute prices for ALL
-// symbols for the past N_DAYS days. Uses a random walk model.
-// Run manually from MarketAI menu → "Simulate Data (Testing)".
 
-function simulateMinuteData() {
-  const N_DAYS              = 5;   // how many trading days to simulate
-  const BARS_PER_DAY        = 75;  // ~75 minutes per NSE session (9:15–10:30, enough for testing)
-  const VOLATILITY_PER_MIN  = 0.003; // 0.3% max move per minute
-  const BASE_PRICE_MIN      = 50;
-  const BASE_PRICE_MAX      = 3000;
-
-  console.log(`[Simulate] Generating ${N_DAYS} days × ${BARS_PER_DAY} bars for all NSE symbols…`);
-  const startTime = Date.now();
-
-  const ss       = SpreadsheetApp.getActiveSpreadsheet();
-  const nseSheet = ss.getSheetByName(CONFIG.NSE_SHEET);
-  if (!nseSheet) { console.error('[Simulate] NSE sheet not found'); return; }
-
-  const lastRow = nseSheet.getLastRow();
-  if (lastRow < 2) { console.error('[Simulate] NSE sheet has no symbols (run "Create Market Sheets" first)'); return; }
-
-  // Get existing symbols
-  const symbols = nseSheet.getRange(2, 1, lastRow - 1, 1).getValues()
-                          .map(r => String(r[0] || '').trim()).filter(Boolean);
-
-  if (symbols.length === 0) { console.error('[Simulate] No symbols in NSE sheet'); return; }
-
-  console.log(`[Simulate] Found ${symbols.length} symbols`);
-
-  // Clear existing time-series columns
-  const existingLastCol = nseSheet.getLastColumn();
-  if (existingLastCol > 1) {
-    nseSheet.deleteColumns(2, existingLastCol - 1);
-  }
-
-  // Build trading day timestamps going back N_DAYS from today
-  const allTimestamps = [];
-  const today         = new Date();
-
-  for (let d = N_DAYS - 1; d >= 0; d--) {
-    const dayDate = new Date(today);
-    dayDate.setDate(today.getDate() - d);
-    const weekday = dayDate.getDay();
-    if (weekday === 0 || weekday === 6) continue; // skip weekends
-
-    const dateStr = Utilities.formatDate(dayDate, CONFIG.TIMEZONE, 'yyyy-MM-dd');
-
-    for (let m = 0; m < BARS_PER_DAY; m++) {
-      const minOffset = m;
-      const hour      = 9 + Math.floor((15 + minOffset) / 60);
-      const minute    = (15 + minOffset) % 60;
-      const ts        = new Date(`${dateStr}T${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}:00+05:30`);
-      allTimestamps.push(ts);
-    }
-  }
-
-  const totalCols = allTimestamps.length;
-  console.log(`[Simulate] Total columns to write: ${totalCols}`);
-
-  if (totalCols === 0) { console.error('[Simulate] No timestamps generated'); return; }
-
-  // Write header row (timestamps)
-  const headerRow = allTimestamps.map(ts => ts);
-  nseSheet.getRange(1, 2, 1, totalCols).setValues([headerRow]).setNumberFormat('dd/MM/yyyy HH:mm');
-
-  // Generate prices for all symbols using random walk
-  // We write in column chunks to stay within Sheets API limits
-  const WRITE_CHUNK  = 50;  // columns per batch write
-  const N            = symbols.length;
-
-  // Initialize base prices per symbol (seeded from symbol string for consistency)
-  const basePrices = symbols.map(sym => {
-    let hash = 0;
-    for (let i = 0; i < sym.length; i++) hash = (hash * 31 + sym.charCodeAt(i)) & 0xffffffff;
-    return BASE_PRICE_MIN + (Math.abs(hash) % (BASE_PRICE_MAX - BASE_PRICE_MIN));
-  });
-
-  // Generate all price data as a 2D array [symbol][colIndex]
-  // We do this in column chunks
-  let currentPrices = basePrices.slice(); // copy
-
-  for (let colStart = 0; colStart < totalCols; colStart += WRITE_CHUNK) {
-    const colEnd   = Math.min(colStart + WRITE_CHUNK, totalCols);
-    const chunkLen = colEnd - colStart;
-
-    // Build 2D array: rows = symbols, cols = this chunk's timestamps
-    const chunk = [];
-    for (let s = 0; s < N; s++) {
-      chunk.push([]);
-    }
-
-    for (let c = 0; c < chunkLen; c++) {
-      // Apply random walk to each symbol's price
-      for (let s = 0; s < N; s++) {
-        const move = 1 + (Math.random() * 2 - 1) * VOLATILITY_PER_MIN;
-        currentPrices[s] = Math.max(1, currentPrices[s] * move);
-        chunk[s].push(parseFloat(currentPrices[s].toFixed(2)));
-      }
-    }
-
-    // Write this chunk
-    nseSheet.getRange(2, colStart + 2, N, chunkLen).setValues(chunk);
-
-    console.log(`[Simulate] Written cols ${colStart + 1}–${colEnd} of ${totalCols}`);
-    SpreadsheetApp.flush(); // flush after each chunk to avoid timeouts
-  }
-
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[Simulate] Done! ${symbols.length} symbols × ${totalCols} columns in ${elapsed}s`);
-  SpreadsheetApp.getUi().alert(
-    `✓ Simulation Complete!\n\n` +
-    `• ${symbols.length} symbols\n` +
-    `• ${N_DAYS} trading days\n` +
-    `• ${BARS_PER_DAY} bars/day = ${totalCols} total columns\n` +
-    `• Time taken: ${elapsed}s\n\n` +
-    `You can now test the Firebase upload via: MarketAI → Force Firebase Upload Now`
-  );
-}
 
 // ─── EOD TRIGGER (existing for all markets including NSE backup) ──────────────
 
@@ -1117,9 +998,7 @@ function forceCleanupNow() {
   dailyCleanup();
 }
 
-function forceSimulateData() {
-  simulateMinuteData();
-}
+
 
 // ─── FULL SETUP (run this once — does everything) ─────────────────────────────
 //
@@ -1387,8 +1266,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('MarketAI')
     .addItem('🚀 Full Setup (Run This First!)', 'fullSetup')
-    .addSeparator()
-    .addItem('📊 Simulate Data (Testing)',      'forceSimulateData')
+
     .addSeparator()
     .addItem('Force Snapshot Now',              'forceSnapshotNow')
     .addItem('Force Firebase Upload Now',       'forceFirebaseUploadNow')
