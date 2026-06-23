@@ -29,8 +29,8 @@ const CONFIG = {
   FIREBASE_SEND_MINUTE_IST:   0,
   RESET_HOUR_IST:             8,           // 8:00 AM IST
   RESET_MINUTE_IST:           0,
-  FIREBASE_BATCH_SIZE:        300,         // Number of symbols to upload in each run
-  FIREBASE_BATCH_DELAY_MINUTES: 30,         // Delay of 30 mins between batches
+  FIREBASE_BATCH_SIZE:        50,          // Number of symbols to upload in each run
+  FIREBASE_BATCH_DELAY_MINUTES: 10,         // Delay of 10 mins between batches
   MARKETS: [
     { name: 'NSE',    sheet: 'NSE',    prefix: 'NSE',    closeCol: 2,  openCol: 3,  highCol: 4,  lowCol: 5,  runAfterIST: '15:35', intraday: true  },
     { name: 'NASDAQ', sheet: 'NASDAQ', prefix: 'NASDAQ', closeCol: 6,  openCol: 7,  highCol: 8,  lowCol: 9,  runAfterIST: '02:35', intraday: false },
@@ -322,43 +322,54 @@ function captureIntradaySnapshot() {
 
 function sendToFirebase() {
   const todayStr = getDayIST();
-  console.log(`[Firebase] Initializing batched upload for ${todayStr}...`);
+  console.log(`[Firebase] Manually initializing batched upload for ${todayStr}...`);
 
-  if (!isWeekday()) {
-    console.log('[Firebase] Weekend — skipping Firebase upload');
-    return;
-  }
-
-  // Clear any leftover batch triggers to avoid duplicate runs
-  clearAllBatchTriggers();
-
-  // Initialize batch state
   const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('FB_BATCH_COMPLETE'); // clear completion flag so we can force rerun
   props.setProperty('FB_BATCH_OFFSET', '0');
   props.setProperty('FB_BATCH_DATE', todayStr);
 
-  // Execute the first batch immediately
-  executeFirebaseBatch();
+  executeFirebaseBatchPeriodic(todayStr, props);
 }
 
 /**
- * Executes a single batch upload of stock data.
+ * Periodically called (every 10 min) to upload EOD data.
+ * Checks time (after 4 PM IST), weekday status, same/unchanged data, and runs chunk.
  */
-function executeFirebaseBatch() {
-  const startTime = Date.now();
-  const todayStr  = getDayIST();
-  const props     = PropertiesService.getScriptProperties();
-
-  const batchDate = props.getProperty('FB_BATCH_DATE');
-  if (batchDate !== todayStr) {
-    console.warn(`[Firebase] Batch run ignored. Date mismatch (batchDate: ${batchDate}, today: ${todayStr}).`);
+function sendToFirebaseBatchPeriodic() {
+  if (!isWeekday()) {
+    console.log('[Firebase] Periodic Sync: Weekend — skipping');
     return;
   }
 
-  let offset = Number(props.getProperty('FB_BATCH_OFFSET') || '0');
-  const BATCH_SIZE = CONFIG.FIREBASE_BATCH_SIZE;
+  // Check if it is past 4:00 PM IST (16:00)
+  const timeIST = getTimeIST();
+  const [h, m] = timeIST.split(':').map(Number);
+  const minutes = h * 60 + m;
+  const fourPm = 16 * 60; // 16:00 IST
 
-  console.log(`[Firebase] Starting batch upload: Offset ${offset}, Batch Size ${BATCH_SIZE}`);
+  if (minutes < fourPm) {
+    console.log(`[Firebase] Periodic Sync: Outside sync hours (${timeIST}) — skipping`);
+    return;
+  }
+
+  const todayStr = getDayIST();
+  const props    = PropertiesService.getScriptProperties();
+
+  // If today's upload is already complete, exit
+  if (props.getProperty('FB_BATCH_COMPLETE') === todayStr) {
+    return;
+  }
+
+  // Otherwise, run the batch upload
+  executeFirebaseBatchPeriodic(todayStr, props);
+}
+
+/**
+ * Executes a single batch upload chunk.
+ */
+function executeFirebaseBatchPeriodic(todayStr, props) {
+  const startTime = Date.now();
 
   const ss       = SpreadsheetApp.getActiveSpreadsheet();
   const nseSheet = ss.getSheetByName(CONFIG.NSE_SHEET);
@@ -371,10 +382,10 @@ function executeFirebaseBatch() {
     return;
   }
 
-  // Read header row to find today's columns
+  // Find today's columns
   const headers   = nseSheet.getRange(1, 2, 1, lastCol - 1).getValues()[0];
-  const todayCols = [];  // 0-indexed within headers array (col B = headers[0])
-  const colTsMap  = {};  // col-offset → timestamp ms
+  const todayCols = [];
+  const colTsMap  = {};
 
   headers.forEach((h, idx) => {
     if (!h) return;
@@ -387,27 +398,40 @@ function executeFirebaseBatch() {
     }
   });
 
+  // If no columns recorded for today (no new data or holiday), skip EOD upload completely
   if (todayCols.length === 0) {
-    console.warn('[Firebase] No today columns found in NSE sheet');
+    console.log(`[Firebase] No new columns captured today. Skipping EOD upload for ${todayStr}.`);
+    props.setProperty('FB_BATCH_COMPLETE', todayStr);
     return;
   }
 
-  // Read all symbols
+  // Initialize or resume batch run
+  let batchDate = props.getProperty('FB_BATCH_DATE');
+  let offset = 0;
+
+  if (batchDate !== todayStr) {
+    props.setProperty('FB_BATCH_DATE', todayStr);
+    props.setProperty('FB_BATCH_OFFSET', '0');
+    offset = 0;
+  } else {
+    offset = Number(props.getProperty('FB_BATCH_OFFSET') || '0');
+  }
+
   const symValues  = nseSheet.getRange(2, 1, lastRow - 1, 1).getValues().map(r => String(r[0] || '').trim());
   const allSymbols = symValues.filter(Boolean);
+  const BATCH_SIZE = CONFIG.FIREBASE_BATCH_SIZE;
 
   if (offset >= allSymbols.length) {
-    console.log(`[Firebase] All symbols already uploaded (${allSymbols.length}). Finished.`);
+    console.log(`[Firebase] All symbols already uploaded. Finalizing.`);
+    finalizeFirebaseUpload(todayStr, todayCols.length, allSymbols.length, props);
     return;
   }
 
   const batchSymbols = allSymbols.slice(offset, offset + BATCH_SIZE);
-  console.log(`[Firebase] Processing symbols ${offset} to ${offset + batchSymbols.length} of ${allSymbols.length}`);
+  console.log(`[Firebase] Processing batch: symbols ${offset} to ${offset + batchSymbols.length} of ${allSymbols.length}`);
 
   // Build per-symbol minute bars for this batch
   const symbolBars = {};
-  
-  // Read today's columns for only this batch slice (rowStart = offset + 2)
   const data = nseSheet.getRange(offset + 2, 2, batchSymbols.length, lastCol - 1).getValues();
 
   for (let r = 0; r < batchSymbols.length; r++) {
@@ -439,7 +463,6 @@ function executeFirebaseBatch() {
   }
 
   // 1. Per-symbol daily document: historicalData/{date}/stocks/{symbol}
-  // Large payloads: flush every 100 documents to avoid REST payload limits (10MB)
   for (const sym of symbols) {
     const bars  = symbolBars[sym];
     const prices = bars.map(b => b.price);
@@ -463,10 +486,9 @@ function executeFirebaseBatch() {
 
     if (writes.length >= 100) flushBatch();
   }
-  flushBatch(); // flush remaining historical docs
+  flushBatch();
 
   // 2. Latest price index: stocks/{symbol}
-  // Light payloads: flush every 400 documents
   for (const sym of symbols) {
     const bars   = symbolBars[sym];
     const prices = bars.map(b => b.price);
@@ -488,95 +510,49 @@ function executeFirebaseBatch() {
 
     if (writes.length >= 400) flushBatch();
   }
-  flushBatch(); // flush remaining latest docs
+  flushBatch();
 
-  // Update offset in Script Properties
+  // Save new offset
   const nextOffset = offset + BATCH_SIZE;
   props.setProperty('FB_BATCH_OFFSET', String(nextOffset));
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   console.log(`[Firebase] Batch run complete. ${writeCount} docs processed in ${elapsed}s`);
 
-  // Check if we need to schedule the next batch
-  if (nextOffset < allSymbols.length) {
-    console.log(`[Firebase] Scheduling next batch (Offset: ${nextOffset}) in ${CONFIG.FIREBASE_BATCH_DELAY_MINUTES} minutes...`);
-    ScriptApp.newTrigger('sendToFirebaseBatch')
-      .timeBased()
-      .after(CONFIG.FIREBASE_BATCH_DELAY_MINUTES * 60 * 1000)
-      .create();
-  } else {
-    console.log(`[Firebase] All batches finished! Finalizing...`);
-    
-    // Finalize master index
-    pushSymbolIndexToFirebase();
-
-    // Day metadata
-    const metaWrites = [
-      buildFirestoreWrite(`intradaySnapshots/${todayStr}/metadata`, {
-        date:          todayStr,
-        snapshotCount: todayCols.length,
-        symbolCount:   allSymbols.length,
-        syncedAt:      Date.now(),
-      }, fb)
-    ];
-    firestoreBatchWrite(metaWrites);
-
-    // Clean up properties
-    props.deleteProperty('FB_BATCH_OFFSET');
-    props.deleteProperty('FB_BATCH_DATE');
-    console.log(`[Firebase] Batched upload fully completed for today.`);
+  // If final batch, finalize immediately
+  if (nextOffset >= allSymbols.length) {
+    finalizeFirebaseUpload(todayStr, todayCols.length, allSymbols.length, props);
   }
 }
 
 /**
- * Trigger handler for subsequent batches.
- * Deletes itself to prevent accumulation, then runs the next batch.
+ * Finalizes the upload by writing metadata and pushing master symbols index.
  */
-function sendToFirebaseBatch(e) {
-  if (e && e.triggerUid) {
-    deleteTriggerById(e.triggerUid);
-  }
-  executeFirebaseBatch();
-}
+function finalizeFirebaseUpload(todayStr, snapshotCount, symbolCount, props) {
+  console.log(`[Firebase] Finalizing upload for ${todayStr}...`);
+  const fb = getFirebaseConfig();
 
-/**
- * Deletes a trigger by its unique ID.
- */
-function deleteTriggerById(id) {
-  if (!id) return;
-  try {
-    const triggers = ScriptApp.getProjectTriggers();
-    for (const t of triggers) {
-      if (t.getUniqueId() === id) {
-        ScriptApp.deleteTrigger(t);
-        console.log(`[Firebase] Successfully deleted temporary trigger: ${id}`);
-        break;
-      }
-    }
-  } catch (err) {
-    console.error(`[Firebase] Failed to delete trigger ${id}: ${err.message}`);
-  }
-}
+  // Finalize master index
+  pushSymbolIndexToFirebase();
 
-/**
- * Clears all temporary batch triggers.
- */
-function clearAllBatchTriggers() {
-  try {
-    const triggers = ScriptApp.getProjectTriggers();
-    let count = 0;
-    for (const t of triggers) {
-      if (t.getHandlerFunction() === 'sendToFirebaseBatch') {
-        ScriptApp.deleteTrigger(t);
-        count++;
-      }
-    }
-    if (count > 0) {
-      console.log(`[Firebase] Cleared ${count} leftover batch trigger(s)`);
-    }
-  } catch (err) {
-    console.error(`[Firebase] Error clearing batch triggers: ${err.message}`);
-  }
+  // Day metadata
+  const metaWrites = [
+    buildFirestoreWrite(`intradaySnapshots/${todayStr}/metadata`, {
+      date:          todayStr,
+      snapshotCount: snapshotCount,
+      symbolCount:   symbolCount,
+      syncedAt:      Date.now(),
+    }, fb)
+  ];
+  firestoreBatchWrite(metaWrites);
+
+  // Set today's run as complete
+  props.setProperty('FB_BATCH_COMPLETE', todayStr);
+  
+  // Clean up batch properties
+  props.deleteProperty('FB_BATCH_OFFSET');
+  props.deleteProperty('FB_BATCH_DATE');
+  console.log(`[Firebase] Batched upload fully completed for today.`);
 }
 
 // ─── RESET SHEET (8:00 AM IST trigger) ───────────────────────────────────────
@@ -921,12 +897,10 @@ function setupTriggers() {
     .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES)
     .create();
 
-  // 2. Send to Firebase at 4:00 PM IST
-  ScriptApp.newTrigger('sendToFirebase')
+  // 2. Send to Firebase (runs every 10 minutes, uploads after 4:00 PM IST)
+  ScriptApp.newTrigger('sendToFirebaseBatchPeriodic')
     .timeBased()
-    .atHour(CONFIG.FIREBASE_SEND_HOUR_IST)
-    .nearMinute(CONFIG.FIREBASE_SEND_MINUTE_IST)
-    .everyDays(1)
+    .everyMinutes(10)
     .create();
 
   // 3. Reset sheet at 8:00 AM IST
@@ -957,7 +931,7 @@ function setupTriggers() {
   SpreadsheetApp.getUi().alert(
     '✓ All Triggers Set:\n\n' +
     '• Intraday (NSE): every 1 min (Mon–Fri 9:15–15:30 IST)\n' +
-    '• Firebase Upload: 4:00 PM IST daily\n' +
+    '• Firebase Upload: every 10 min (runs after 4:00 PM IST)\n' +
     '• Sheet Reset:    8:00 AM IST daily\n' +
     '• EOD (ASX):      11:40 IST\n' +
     '• EOD (JPX):      12:10 IST\n' +
@@ -1073,14 +1047,19 @@ function fullSetup() {
     existing.forEach(t => ScriptApp.deleteTrigger(t));
     log.push(`✓ Cleared ${existing.length} old trigger(s)`);
 
+    // Clear batch state properties to ensure clean slate
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty('FB_BATCH_OFFSET');
+    props.deleteProperty('FB_BATCH_DATE');
+    props.deleteProperty('FB_BATCH_COMPLETE');
+
     // Per-minute intraday
     ScriptApp.newTrigger('captureIntradaySnapshot').timeBased()
       .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES).create();
 
-    // Firebase upload at 4 PM IST
-    ScriptApp.newTrigger('sendToFirebase').timeBased()
-      .atHour(CONFIG.FIREBASE_SEND_HOUR_IST).nearMinute(CONFIG.FIREBASE_SEND_MINUTE_IST)
-      .everyDays(1).create();
+    // Firebase upload periodic trigger
+    ScriptApp.newTrigger('sendToFirebaseBatchPeriodic').timeBased()
+      .everyMinutes(10).create();
 
     // Sheet reset at 8 AM IST
     ScriptApp.newTrigger('resetSheet').timeBased()
@@ -1097,7 +1076,7 @@ function fullSetup() {
     ScriptApp.newTrigger('dailyCleanup').timeBased()
       .atHour(0).nearMinute(30).everyDays(1).create();
 
-    log.push('✓ Triggers set: 1-min capture | 4PM Firebase | 8AM reset | EOD | cleanup');
+    log.push('✓ Triggers set: 1-min capture | 10-min Firebase | 8AM reset | EOD | cleanup');
   } catch (e) {
     log.push(`✗ Trigger setup error: ${e.message}`);
   }
