@@ -1,0 +1,28 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "stocks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "lastUpdated", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "stocks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "todayDate",   "order": "ASCENDING"  },
+        { "fieldPath": "lastPrice",   "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "stocks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "symbol",      "order": "ASCENDING"  },
+        { "fieldPath": "lastUpdated", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

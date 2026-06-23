@@ -2040,12 +2040,28 @@ async function doSync(silent=false){
   setLoad(30);
   try{
     let d;
+    let syncedViaServer = false;
     try {
       const r=await fetch(`${API}/api/sync`, { method: 'POST' });
       const j=await r.json();
       setLoad(70);
       if(!j.ok)throw new Error(j.error||'Sync failed');
-      d=await fetchData();
+
+      // If sync returned the full pool inline (KV/file unavailable), use it directly
+      if (j.snapshots && j.snapshots.length > 0) {
+        d = j; // sync embedded the full data — use it directly
+        // Preserve existing user data that the sync response doesn't know about
+        d.portfolio = S.portfolio || [];
+        d.watchlists = S.watchlists || [];
+        d.watchlistItems = S.watchlistItems || [];
+        d.alerts = S.alerts || [];
+        d.screeners = S.screeners || [];
+        syncedViaServer = true;
+      } else {
+        // KV was available and saved — read the freshly persisted data
+        d = await fetchData();
+        syncedViaServer = true;
+      }
     } catch (apiErr) {
       console.warn('Server sync failed, falling back to direct browser sync from Google Sheets:', apiErr);
       setLoad(50);
@@ -3554,27 +3570,59 @@ document.querySelectorAll('.m-nav-item[data-pg]').forEach(el=>{
     console.warn('Error loading cache:', e);
   }
 
-  // 2. Fetch fresh data from API in background
+  // 2. Fetch fresh data — API first, then Google Sheets if API returns empty
   try {
-    const d = await fetchData();
-    mergeData(d);
-    setLoad(80);
-    if (S.lastSync) setSyncState('ok', `Loaded · ${S.snapshots.length} snaps · ${fago(S.lastSync)}`);
-    renderTicker();
-    renderSidebar();
+    let d = null;
 
-    if (!hasCache) {
-      nav('dashboard');
-    } else {
-      renderAll();
+    // Try the server API
+    try {
+      const apiResp = await fetch(`${API}/api/data`);
+      if (apiResp.ok) {
+        const apiData = await apiResp.json();
+        if (apiData && apiData.snapshots && apiData.snapshots.length > 0) {
+          d = apiData;
+        } else {
+          // API returned empty (KV unavailable) — fall back to direct sheet fetch
+          console.warn('[MarketAI] /api/data returned empty snapshots — fetching from Google Sheets directly...');
+          setSyncState('spin', 'Loading from Google Sheets...');
+        }
+      }
+    } catch (apiErr) {
+      console.warn('[MarketAI] /api/data failed:', apiErr.message);
     }
-    setLoad(100);
-    setTimeout(() => setLoad(0), 600);
 
-    // Auto-sync on open if stale (>10 min) or no data
-    const stale = !S.lastSync || Date.now() - S.lastSync > 10 * 60 * 1000;
-    if (stale) {
-      setTimeout(() => doSync(S.snapshots.length > 0), 1200);
+    // If server had no data, fetch directly from Google Sheets
+    if (!d) {
+      try {
+        d = await fetchFromGoogleSheetsRealtime();
+      } catch (sheetsErr) {
+        console.warn('[MarketAI] Google Sheets direct fetch failed:', sheetsErr.message);
+      }
+    }
+
+    if (d && d.snapshots && d.snapshots.length > 0) {
+      mergeData(d);
+      setLoad(80);
+      if (S.lastSync) setSyncState('ok', `Loaded · ${S.snapshots.length} snaps · ${fago(S.lastSync)}`);
+      renderTicker();
+      renderSidebar();
+
+      if (!hasCache) {
+        nav('dashboard');
+      } else {
+        renderAll();
+      }
+      setLoad(100);
+      setTimeout(() => setLoad(0), 600);
+
+      // Auto-sync to persist data server-side if KV/file isn't saving it
+      // Always sync if stale (>10min) or there's no server-persisted data
+      const stale = !S.lastSync || Date.now() - S.lastSync > 10 * 60 * 1000;
+      if (stale) {
+        setTimeout(() => doSync(S.snapshots.length > 0), 1200);
+      }
+    } else {
+      throw new Error('No market data available from any source');
     }
   } catch (e) {
     console.error('Error fetching fresh data:', e);
@@ -3585,10 +3633,10 @@ document.querySelectorAll('.m-nav-item[data-pg]').forEach(el=>{
       renderTicker();
       renderSidebar();
       nav('dashboard');
-      toast('Demo mode: loaded fallback market data', 'ok');
+      toast('Demo mode: tap Sync to load live data', 'ok');
     } else {
       setSyncState('ok', `Offline/Cached · ${fago(S.lastSync)}`);
-      toast('Fresh data fetch failed: ' + e.message, 'err');
+      toast('Fresh data fetch failed — using cached data. ' + e.message, 'err');
     }
     setLoad(0);
   }

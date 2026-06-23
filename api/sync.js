@@ -1,5 +1,6 @@
 // api/sync.js
 // Fetches Google Sheet prices → merges into Vercel KV (chunked) or local files
+// Also pushes latest prices to Firebase Firestore when configured.
 //
 // WHY CHUNKED?
 // A single pool of 200 snapshots × 2400+ symbols is ~4MB.
@@ -11,6 +12,113 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+
+// ── Firebase config ──────────────────────────────────────────────────────────
+const FB_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "";
+const FB_API_KEY    = process.env.FIREBASE_API_KEY    || "";
+
+/**
+ * Push latest prices from the most recent snapshot to Firestore /stocks/{symbol}.
+ * Uses a single batchWrite for efficiency (up to 500 docs per batch).
+ */
+async function pushLatestToFirebase(pool) {
+  if (!FB_PROJECT_ID || !FB_API_KEY) return false;
+  if (!pool.snapshots || pool.snapshots.length === 0) return false;
+
+  // Use the most recent snapshot
+  const latest = pool.snapshots[pool.snapshots.length - 1];
+  if (!latest || !latest.prices) return false;
+
+  const symbols   = Object.keys(latest.prices);
+  if (symbols.length === 0) return false;
+
+  const dateStr   = new Date(latest.ts).toISOString().slice(0, 10);
+  const baseDocPath = `projects/${FB_PROJECT_ID}/databases/(default)/documents`;
+
+  function toFbValue(val) {
+    if (val === null || val === undefined) return { nullValue: null };
+    if (typeof val === "boolean")          return { booleanValue: val };
+    if (typeof val === "number")           return Number.isInteger(val)
+      ? { integerValue: String(val) }
+      : { doubleValue: val };
+    if (typeof val === "string")           return { stringValue: val };
+    if (Array.isArray(val))                return { arrayValue: { values: val.map(toFbValue) } };
+    if (typeof val === "object")           return { mapValue: { fields: toFbFields(val) } };
+    return { stringValue: String(val) };
+  }
+  function toFbFields(obj) {
+    const r = {};
+    for (const [k, v] of Object.entries(obj)) r[k] = toFbValue(v);
+    return r;
+  }
+
+  const BATCH_LIMIT = 400;
+  let   writes      = [];
+  let   batches     = 0;
+
+  async function flush() {
+    if (writes.length === 0) return;
+    const url     = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT_ID}/databases/(default)/documents:batchWrite?key=${FB_API_KEY}`;
+    const bodyStr = JSON.stringify({ writes });
+    const parsed  = new URL(url);
+
+    await new Promise((resolve) => {
+      const options = {
+        hostname: parsed.hostname, port: 443,
+        path:     parsed.pathname + parsed.search,
+        method:   "POST",
+        headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(bodyStr) },
+      };
+      const req = https.request(options, res => { res.resume(); res.on("end", resolve); });
+      req.on("error", () => resolve());
+      req.write(bodyStr);
+      req.end();
+    });
+    batches++;
+    writes = [];
+  }
+
+  for (const sym of symbols) {
+    const priceData = latest.prices[sym];
+    // priceData can be a plain number (intraday) or {c,o,h,l} object (EOD)
+    const close = typeof priceData === "object" ? priceData.c : priceData;
+    const open  = typeof priceData === "object" ? priceData.o : priceData;
+    const high  = typeof priceData === "object" ? priceData.h : priceData;
+    const low   = typeof priceData === "object" ? priceData.l : priceData;
+
+    writes.push({
+      update: {
+        name:   `${baseDocPath}/stocks/${sym}`,
+        fields: toFbFields({
+          symbol:      sym,
+          lastPrice:   close,
+          lastUpdated: Date.now(),
+          snapshotTs:  latest.ts,
+          snapshotLabel: latest.label || "",
+          todayDate:   dateStr,
+          todayOpen:   open,
+          todayHigh:   high,
+          todayLow:    low,
+          todayClose:  close,
+        }),
+      },
+    });
+
+    if (writes.length >= BATCH_LIMIT) await flush();
+  }
+
+  // Stock index
+  writes.push({
+    update: {
+      name:   `${baseDocPath}/stockIndex/master`,
+      fields: toFbFields({ symbols: pool.symbols || [], count: pool.symbols?.length || 0, lastUpdated: Date.now(), lastDate: dateStr }),
+    },
+  });
+  await flush();
+
+  console.log(`[Firebase] Pushed ${symbols.length} latest prices in ${batches} batch(es)`);
+  return true;
+}
 
 const SHEET_ID = "1o6L7bHDrUozEPaLFsXPtls7Jey88lQm0789fq5T2GqA";
 const DATA_FILE = path.join(__dirname, "../data.json");
@@ -576,16 +684,44 @@ module.exports = async (req, res) => {
       fileSaved = true;
     } catch (e) {}
 
-    res.writeHead(200, CORS_HEADERS);
-    res.end(JSON.stringify({
+    // Push latest snapshot to Firebase Firestore (secondary storage, non-blocking)
+    let fbSaved = false;
+    if (FB_PROJECT_ID && FB_API_KEY) {
+      try {
+        fbSaved = await pushLatestToFirebase(pool);
+      } catch (fbErr) {
+        console.error("[Firebase push error]:", fbErr.message);
+      }
+    }
+
+    // When KV/file persistence is unavailable, embed the full pool in the response
+    // so the frontend can cache it in localStorage without a second /api/data round-trip.
+    const persistOk = kvSaved || fileSaved;
+    const responseObj = {
       ok: true,
       snapshotsAdded: toAdd.length,
       totalSnapshots: pool.snapshots.length,
       totalSymbols: pool.symbols.length,
       lastSync: pool.lastSync,
       kvSaved,
-      fileSaved
-    }));
+      fileSaved,
+      kvAvailable: !!(KV_URL && KV_TOKEN),
+    };
+
+    // Embed full pool when we can't persist — frontend will save to localStorage
+    if (!persistOk) {
+      responseObj.snapshots = pool.snapshots;
+      responseObj.symbols = pool.symbols;
+      responseObj.syncCount = pool.syncCount || 1;
+      responseObj.portfolio = [];
+      responseObj.watchlists = [];
+      responseObj.watchlistItems = [];
+      responseObj.alerts = [];
+      responseObj.screeners = [];
+    }
+
+    res.writeHead(200, CORS_HEADERS);
+    res.end(JSON.stringify(responseObj));
 
   } catch (err) {
     console.error("[Sync Error]:", err.message, err.stack);
