@@ -995,7 +995,6 @@ function forceCleanupNow() {
 //  5. Show a summary of what was done
 
 function fullSetup() {
-  const ui        = SpreadsheetApp.getUi();
   const log       = [];
   const startTime = Date.now();
 
@@ -1050,11 +1049,7 @@ function fullSetup() {
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   log.push(`\n⏱ Completed in ${elapsed}s`);
 
-  ui.alert(
-    '✅ MarketAI — Full Setup Complete',
-    log.join('\n'),
-    ui.ButtonSet.OK
-  );
+  console.log('✅ MarketAI — Full Setup Complete:\n' + log.join('\n'));
 }
 
 // ─── PUSH SYMBOL INDEX TO FIREBASE ───────────────────────────────────────────
