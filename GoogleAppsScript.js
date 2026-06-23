@@ -1015,6 +1015,32 @@ function fullSetup() {
       hdrRange.setValues([hdrLabels]).setFontWeight('bold');
 
       log.push('✓ SYMBOLS sheet: Headers configured');
+
+      const lastRow = symbolsSheet.getLastRow();
+      if (lastRow > 1) {
+        // Clear all foreign exchange and daily OHLC formulas from Col C (3) onwards
+        // to prevent sheet from recalculating 57,000+ useless formulas and freezing.
+        const lastCol = symbolsSheet.getLastColumn();
+        if (lastCol > 2) {
+          symbolsSheet.getRange(2, 3, lastRow - 1, lastCol - 2).clearContent();
+          log.push('✓ SYMBOLS sheet: Cleared foreign market formulas to prevent spreadsheet freeze');
+        }
+
+        // Initialize Col B (NSE price) formulas only if they are missing
+        const hasFormulas = symbolsSheet.getRange(2, 2).getFormula();
+        if (!hasFormulas) {
+          const symValues = symbolsSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+          const nseFormulas = symValues.map((r, ri) => {
+            const rowNum = ri + 2;
+            const sym = String(r[0] || '').trim();
+            return sym ? [`=IF(A${rowNum}="","",GOOGLEFINANCE("NSE:"&A${rowNum},"price"))`] : [''];
+          });
+          symbolsSheet.getRange(2, 2, nseFormulas.length, 1).setFormulas(nseFormulas);
+          log.push(`✓ SYMBOLS sheet: NSE price formulas set for ${lastRow - 1} symbols`);
+        } else {
+          log.push('✓ SYMBOLS sheet: NSE price formulas already exist');
+        }
+      }
     } else {
       log.push('⚠ SYMBOLS sheet not found — please create it with stock symbols in column A');
     }
