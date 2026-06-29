@@ -10,6 +10,9 @@
     }
   ],
   "cleanUrls": true,
+  "rewrites": [
+    { "source": "/((?!api/|.*\\.).*)", "destination": "/index.html" }
+  ],
   "functions": {
     "api/sync.js":     { "maxDuration": 60 },
     "api/firebase.js": { "maxDuration": 60 },

@@ -75,10 +75,13 @@ function isMarketHours() {
   return now >= open && now <= close;
 }
 
-function isWeekday() {
-  // Use IST date to check weekday
+function getDayOfWeekIST() {
   const dateIST = new Date(Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd'));
-  const day = new Date(dateIST.getUTCFullYear(), dateIST.getUTCMonth(), dateIST.getUTCDate()).getDay();
+  return new Date(dateIST.getUTCFullYear(), dateIST.getUTCMonth(), dateIST.getUTCDate()).getDay();
+}
+
+function isWeekday() {
+  const day = getDayOfWeekIST();
   return day >= 1 && day <= 5;
 }
 
@@ -337,9 +340,17 @@ function sendToFirebase() {
  * Checks time (after 4 PM IST), weekday status, same/unchanged data, and runs chunk.
  */
 function sendToFirebaseBatchPeriodic() {
-  if (!isWeekday()) {
-    console.log('[Firebase] Periodic Sync: Weekend — skipping');
+  const day = getDayOfWeekIST();
+  if (day === 0) { // Sunday
+    console.log('[Firebase] Periodic Sync: Sunday — skipping');
     return;
+  }
+
+  // 1. Run EOD OHLC checks for all markets
+  try {
+    logStockPrices();
+  } catch (e) {
+    console.error(`[Firebase] Periodic EOD check error: ${e.message}`);
   }
 
   // Check if it is past 4:00 PM IST (16:00)
@@ -349,7 +360,12 @@ function sendToFirebaseBatchPeriodic() {
   const fourPm = 16 * 60; // 16:00 IST
 
   if (minutes < fourPm) {
-    console.log(`[Firebase] Periodic Sync: Outside sync hours (${timeIST}) — skipping`);
+    console.log(`[Firebase] Periodic Sync: Outside sync hours (${timeIST}) — skipping batch upload`);
+    return;
+  }
+
+  // Only run batch upload if it's a weekday (NSE only trades weekdays)
+  if (!isWeekday()) {
     return;
   }
 
@@ -566,6 +582,14 @@ function resetSheet() {
     return;
   }
 
+  // Run daily cleanup first
+  try {
+    console.log('[Reset] Running daily cleanup…');
+    dailyCleanup();
+  } catch (e) {
+    console.error(`[Reset] Daily cleanup failed: ${e.message}`);
+  }
+
   console.log('[Reset] Starting morning sheet reset…');
 
   const ss       = SpreadsheetApp.getActiveSpreadsheet();
@@ -593,7 +617,13 @@ function resetSheet() {
 
 // ─── EOD TRIGGER (existing for all markets including NSE backup) ──────────────
 
-function logStockPrices() {
+function logStockPrices(force = false) {
+  const day = getDayOfWeekIST();
+  if (!force && day === 0) { // Sunday
+    console.log('[MarketAI EOD] Sunday — skipping EOD logging');
+    return;
+  }
+
   const now      = getNowIST();
   const nowIST   = getTimeIST();
   const startTime = Date.now();
@@ -607,14 +637,29 @@ function logStockPrices() {
   if (lastRow < 1) { console.warn('[MarketAI] SYMBOLS sheet empty'); return; }
 
   const allData = symbolsSheet.getRange(1, 1, lastRow, maxCol).getValues();
+  const props   = PropertiesService.getScriptProperties();
+  const todayStr = getDayIST();
 
   for (const market of CONFIG.MARKETS) {
     try {
-      if (!isAfterIST(nowIST, market.runAfterIST)) continue;
+      const lastRunKey = 'EOD_RUN_' + market.name;
+      if (!force && props.getProperty(lastRunKey) === todayStr) continue;
+
+      const isValidDay = market.name === 'NASDAQ' ? (day >= 2 && day <= 6) : (day >= 1 && day <= 5);
+      if (!force && !isValidDay) continue;
+
+      if (!force && !isAfterIST(nowIST, market.runAfterIST)) continue;
+
       const marketSheet = ss.getSheetByName(market.sheet);
       if (!marketSheet) { console.warn(`[MarketAI] Sheet "${market.sheet}" missing`); continue; }
-      if (!market.intraday && hasWrittenToday(marketSheet)) continue;
+      if (!force && !market.intraday && hasWrittenToday(marketSheet)) {
+        // Already written to sheet today (failsafe), record state and skip
+        props.setProperty(lastRunKey, todayStr);
+        continue;
+      }
+
       processMarket(ss, market, allData, now);
+      props.setProperty(lastRunKey, todayStr);
     } catch (e) {
       console.error(`[MarketAI] ${market.name} Error: ${e.message}`);
     }
@@ -907,13 +952,13 @@ function setupTriggers() {
     .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES)
     .create();
 
-  // 2. Send to Firebase (runs every 10 minutes, uploads after 4:00 PM IST)
+  // 2. Send to Firebase & EOD Logging (runs every 10 minutes)
   ScriptApp.newTrigger('sendToFirebaseBatchPeriodic')
     .timeBased()
     .everyMinutes(10)
     .create();
 
-  // 3. Reset sheet at 8:00 AM IST
+  // 3. Reset sheet at 8:00 AM IST (also runs daily EOD cleanup)
   ScriptApp.newTrigger('resetSheet')
     .timeBased()
     .atHour(CONFIG.RESET_HOUR_IST)
@@ -921,35 +966,11 @@ function setupTriggers() {
     .everyDays(1)
     .create();
 
-  // 4. EOD triggers for all markets
-  [
-    { h: 11, m: 40 },  // ASX
-    { h: 12, m: 10 },  // JPX
-    { h: 13, m: 40 },  // SGX / HKEX
-    { h: 15, m: 40 },  // NSE
-    { h: 21, m: 10 },  // LSE
-    { h: 2,  m: 40 },  // NASDAQ
-  ].forEach(t => {
-    ScriptApp.newTrigger('logStockPrices')
-      .timeBased().atHour(t.h).nearMinute(t.m).everyDays(1).create();
-  });
-
-  // 5. Daily cleanup at 00:30 IST
-  ScriptApp.newTrigger('dailyCleanup')
-    .timeBased().atHour(0).nearMinute(30).everyDays(1).create();
-
   SpreadsheetApp.getUi().alert(
     '✓ All Triggers Set:\n\n' +
     '• Intraday (NSE): every 1 min (Mon–Fri 9:15–15:30 IST)\n' +
-    '• Firebase Upload: every 10 min (runs after 4:00 PM IST)\n' +
-    '• Sheet Reset:    8:00 AM IST daily\n' +
-    '• EOD (ASX):      11:40 IST\n' +
-    '• EOD (JPX):      12:10 IST\n' +
-    '• EOD (SGX/HKEX): 13:40 IST\n' +
-    '• EOD (NSE):      15:40 IST\n' +
-    '• EOD (LSE):      21:10 IST\n' +
-    '• EOD (NASDAQ):   02:40 IST\n' +
-    '• Cleanup:        00:30 IST daily\n'
+    '• Firebase Upload & EOD: every 10 min (after market close times)\n' +
+    '• Sheet Reset & Cleanup: 8:00 AM IST daily\n'
   );
 }
 
@@ -1018,7 +1039,7 @@ function fullSetup() {
     ScriptApp.newTrigger('captureIntradaySnapshot').timeBased()
       .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES).create();
 
-    // Firebase upload periodic trigger
+    // Firebase upload & EOD periodic trigger
     ScriptApp.newTrigger('sendToFirebaseBatchPeriodic').timeBased()
       .everyMinutes(10).create();
 
@@ -1027,17 +1048,7 @@ function fullSetup() {
       .atHour(CONFIG.RESET_HOUR_IST).nearMinute(CONFIG.RESET_MINUTE_IST)
       .everyDays(1).create();
 
-    // EOD triggers
-    [{h:11,m:40},{h:12,m:10},{h:13,m:40},{h:15,m:40},{h:21,m:10},{h:2,m:40}].forEach(t => {
-      ScriptApp.newTrigger('logStockPrices').timeBased()
-        .atHour(t.h).nearMinute(t.m).everyDays(1).create();
-    });
-
-    // Daily cleanup
-    ScriptApp.newTrigger('dailyCleanup').timeBased()
-      .atHour(0).nearMinute(30).everyDays(1).create();
-
-    log.push('✓ Triggers set: 1-min capture | 10-min Firebase | 8AM reset | EOD | cleanup');
+    log.push('✓ Triggers set: 1-min capture | 10-min Firebase & EOD | 8AM reset & cleanup');
   } catch (e) {
     log.push(`✗ Trigger setup error: ${e.message}`);
   }
@@ -1175,6 +1186,11 @@ function doGet(e) {
   })).setMimeType(ContentService.MimeType.JSON);
 }
 
+function forceEODLoggingNow() {
+  logStockPrices(true);
+  SpreadsheetApp.getUi().alert('EOD logging forced for all markets (check logs for details).');
+}
+
 // ─── MENU ─────────────────────────────────────────────────────────────────────
 
 function onOpen() {
@@ -1186,6 +1202,7 @@ function onOpen() {
     .addItem('Force Snapshot Now',              'forceSnapshotNow')
     .addItem('Force Firebase Upload Now',       'forceFirebaseUploadNow')
     .addItem('Force Sheet Reset Now',           'forceResetSheetNow')
+    .addItem('Force EOD Logging Now',           'forceEODLoggingNow')
     .addItem('Force EOD Cleanup Now',           'forceCleanupNow')
     .addSeparator()
     .addItem('Advanced: Setup Sheets Only',     'setupMarketSheets')
