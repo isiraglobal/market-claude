@@ -6,17 +6,10 @@
 <title>MarketAI — NSE Intelligence Terminal</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%230a0e1a'/><path d='M6 22 L12 16 L18 20 L26 10' stroke='%2300d2ff' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/><circle cx='26' cy='10' r='3' fill='%2300d2ff'/></svg>">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/css/style.css">
-<script>
-// Early theme initialization to prevent light flash
-(function() {
-  const savedTheme = localStorage.getItem('theme') || 'dark';
-  document.documentElement.setAttribute('data-theme', savedTheme);
-})();
-</script>
+<link rel="stylesheet" href="style.css">
+
 </head>
 <body>
-<!-- SVG Gooey Filter for Liquid Background -->
 <svg style="display:none" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <filter id="gooey">
@@ -25,7 +18,6 @@
     </filter>
   </defs>
 </svg>
-<!-- Liquid background canvas -->
 <canvas id="liquid-bg"></canvas>
 
 <div id="app">
@@ -34,7 +26,6 @@
   <div class="modal" id="mbox"></div>
   <div class="toast-wrap" id="toasts"></div>
 
-  <!-- MOBILE BOTTOM NAV -->
   <nav class="mobile-nav" id="mobileNav">
     <button class="m-nav-item" data-pg="dashboard">
       <svg class="m-nav-icon" viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z" fill="currentColor"/></svg>
@@ -58,9 +49,7 @@
     </button>
   </nav>
 
-  <!-- Desktop App Layout Wrapper -->
   <div class="app-layout">
-    <!-- Left Navigation Sidebar -->
     <div class="nav-sidebar">
       <div class="nav-logo" onclick="handleLogoClick()">
         <svg viewBox="0 0 24 24" class="logo-icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9v-2h2v2zm0-4H9V7h2v5zm4 4h-2v-5h2v5zm0-7h-2V7h2v2z" fill="currentColor"/></svg>
@@ -94,9 +83,7 @@
       </div>
     </div>
 
-    <!-- Right Side Content Wrapper -->
     <div class="app-content-wrapper">
-      <!-- TOP BAR -->
       <div class="topbar">
         <div class="logo" onclick="handleLogoClick()"><div class="logo-dot"></div>MarketAI</div>
         <button class="btn btn-sm btn-ghost" id="toggleSidebarBtn" onclick="toggleSidebar()" style="margin-left: 12px; height: 28px; display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 4px 10px;">
@@ -115,10 +102,8 @@
         </div>
       </div>
 
-      <!-- TICKER -->
       <div id="ticker"><div class="ticker-inner" id="tickerInner"></div></div>
 
-      <!-- BODY -->
       <div class="body">
         <div class="sidebar">
           <div class="sb-hdr">
@@ -142,7 +127,6 @@
     </div>
   </div>
 </div>
-
-<script src="/js/app.js"></script>
+<script src="common.js"></script>
 </body>
 </html>

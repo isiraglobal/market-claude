@@ -58,12 +58,12 @@ function parseTimestamp(raw) {
     const ts = new Date(yr_num, +mo, +day, +hh, +mm, +ss).getTime();
     return isNaN(ts) ? null : ts;
   }
-  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
+  const dmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
   if (dmy) {
-    const [, day, mon, yr, hh, mm, ss = "00"] = dmy;
+    const [, day, mon, yr, hh = "00", mm = "00", ss = "00"] = dmy;
     const yr_num = +yr;
     if (yr_num < 2000 || yr_num > 2100) return null;
-    const ts = new Date(`${yr}-${mon.padStart(2, "0")}-${day.padStart(2, "0")}T${hh.padStart(2, "0")}:${mm.padStart(2, "0")}:${ss.padStart(2, "0")}`).getTime();
+    const ts = new Date(`${yr}-${mon.padStart(2,"0")}-${day.padStart(2,"0")}T${hh.padStart(2,"0")}:${mm.padStart(2,"0")}:${ss.padStart(2,"0")}`).getTime();
     return isNaN(ts) ? null : ts;
   }
   const d = new Date(s);
@@ -72,13 +72,34 @@ function parseTimestamp(raw) {
   return null;
 }
 
+// Pre-computed Set for O(1) lookup vs Array.includes O(n)
+const BAD_VALUES = new Set(["#N/A","N/A","#VALUE!","#REF!","#ERROR!","#NUM!","Loading..."]);
+
 function parsePrice(raw) {
   if (!raw) return null;
   let s = clean(raw);
-  if (!s || ["#N/A", "N/A", "#VALUE!", "#REF!", "#ERROR!", "#NUM!"].includes(s)) return null;
-  let n = parseFloat(s);
-  if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
-  return isFinite(n) && n > 0 ? n : null;
+  if (!s || BAD_VALUES.has(s)) return null;
+
+  // Fast path: single numbers
+  if (s.indexOf(',') === -1) {
+    let n = parseFloat(s);
+    if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
+    return isFinite(n) && n > 0 ? n : null;
+  }
+
+  // OHLC format: "close,open,high,low"
+  const parts = s.split(',');
+  if (parts.length === 4) {
+    const c = parseFloat(parts[0]);
+    const o = parseFloat(parts[1]);
+    const h = parseFloat(parts[2]);
+    const l = parseFloat(parts[3]);
+    if (isFinite(c) && c > 0 && isFinite(o) && o > 0 && isFinite(h) && h > 0 && isFinite(l) && l > 0) {
+      return { c, o, h, l };
+    }
+  }
+
+  return null;
 }
 
 (async () => {

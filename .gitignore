@@ -9,3 +9,4 @@ build/
 data.json
 userdata.json
 .vercel
+.env*

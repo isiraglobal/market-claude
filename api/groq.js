@@ -69,6 +69,7 @@ module.exports = async (req, res) => {
         temperature: 0.2
       };
       return new Promise((resolve, reject) => {
+        const bodyStr = JSON.stringify(payload);
         const options = {
           hostname: "api.groq.com",
           port: 443,
@@ -76,7 +77,8 @@ module.exports = async (req, res) => {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${GROQ_API_KEY}`,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(bodyStr, "utf8")
           }
         };
         const groqReq = https.request(options, (groqRes) => {
@@ -91,7 +93,7 @@ module.exports = async (req, res) => {
           });
         });
         groqReq.on("error", reject);
-        groqReq.write(JSON.stringify(payload));
+        groqReq.write(bodyStr);
         groqReq.end();
       });
     }

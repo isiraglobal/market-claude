@@ -169,28 +169,23 @@ module.exports = async (req, res) => {
     let market = null;
     let user = null;
 
+    // 1. Try KV for market + user data
     if (KV_URL && KV_TOKEN) {
-      // Fetch market (chunked) and user data in parallel
-      const [mRes, uRes] = await Promise.all([
-        getMarketData(),
-        kvGet("user-data")
-      ]);
-      market = mRes;
-      user = uRes;
+      [market, user] = await Promise.all([getMarketData(), kvGet("user-data")]);
     }
 
-    // Fallback to local data.json for market (works in dev, not on Vercel)
+    // 2. Fallback to local data.json (works in dev, not on Vercel)
     if (!market) {
       market = readLocalJSON(DATA_FILE, null);
       if (market && market.snapshots && market.snapshots.length > 0) {
         console.log(`[Data] Serving from local file: ${market.snapshots.length} snaps`);
       } else {
         market = { snapshots: [], symbols: [], lastSync: null, syncCount: 0 };
-        console.warn("[Data] No market data available — KV empty and no local file");
+        console.warn("[Data] No market data available — KV empty, no local file");
       }
     }
 
-    // Fallback to local userdata.json
+    // Fallback to local userdata.json (dev only; Vercel FS is read-only)
     if (!user) {
       try {
         if (fs.existsSync(USER_FILE)) {
