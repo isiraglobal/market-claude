@@ -1,21 +1,7 @@
 {
-  "headers": [
-    {
-      "source": "/api/(.*)",
-      "headers": [
-        { "key": "Access-Control-Allow-Origin",  "value": "*" },
-        { "key": "Access-Control-Allow-Headers", "value": "Content-Type, Authorization" },
-        { "key": "Access-Control-Allow-Methods", "value": "GET, POST, OPTIONS, DELETE" }
-      ]
-    }
-  ],
   "cleanUrls": true,
   "rewrites": [
-    { "source": "/((?!api/|.*\\.).*)", "destination": "/index.html" }
-  ],
-  "functions": {
-    "api/sync.js":     { "maxDuration": 60 },
-    "api/firebase.js": { "maxDuration": 60 },
-    "api/data.js":     { "maxDuration": 30 }
-  }
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
 }
