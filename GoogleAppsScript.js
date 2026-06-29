@@ -1,57 +1,57 @@
 // ===============================================================================
-//  MarketAI — Google Apps Script (GitHub Architecture, No Firebase)
+//  MarketAI — Google Apps Script
 //
-//  Every 1 minute during market hours:
-//    1. Read all prices from SYMBOLS sheet (GOOGLEFINANCE)
-//    2. OHLC-pack and compare hash with previous capture
-//    3. If changed: append to hidden _INTRADAY sheet + update NSE single row
-//    4. If unchanged: skip
+//  09:00 daily — reset NSE sheet (clear columns B+), if trading day
+//  09:15-15:30 IST every 1 min — capture prices, append column to NSE sheet
+//  15:40 IST (EOD) — read NSE columns → merge with GitHub data.json → commit
 //
-//  Daily at 15:40 IST (EOD):
-//    1. Read all today's snapshots from _INTRADAY
-//    2. Fetch existing data.json from GitHub
-//    3. Merge (append today's snapshots)
-//    4. Commit updated data.json via GitHub Git Data API
-//    5. Clear _INTRADAY sheet for next day
+//  Respects NSE holiday calendar. No duplicate snapshots across days.
+//  Only appends when prices actually change (hash comparison).
 // ===============================================================================
 
 const CONFIG = {
   SYMBOLS_SHEET: 'SYMBOLS',
-  INTRADAY_SHEET: '_INTRADAY',
   TIMEZONE: 'Asia/Kolkata',
-  INTRADAY_INTERVAL_MINUTES: 1,
   NSE_MARKET_OPEN: '09:15',
   NSE_MARKET_CLOSE: '15:30',
   GITHUB_REPO: 'isiraglobal/market-claude',
   GITHUB_FILE: 'data.json',
   MAX_SNAPSHOTS: 2000,
-  MARKETS: [
-    { name: 'NSE',    sheet: 'NSE',    prefix: 'NSE',    closeCol: 2,  openCol: 3,  highCol: 4,  lowCol: 5,  runAfterIST: '15:35', intraday: true },
-    { name: 'NASDAQ', sheet: 'NASDAQ', prefix: 'NASDAQ', closeCol: 6,  openCol: 7,  highCol: 8,  lowCol: 9,  runAfterIST: '02:35', intraday: false },
-    { name: 'LSE',    sheet: 'LSE',    prefix: 'LON',    closeCol: 10, openCol: 11, highCol: 12, lowCol: 13, runAfterIST: '21:05', intraday: false },
-    { name: 'SGX',    sheet: 'SGX',    prefix: 'SGX',    closeCol: 14, openCol: 15, highCol: 16, lowCol: 17, runAfterIST: '13:35', intraday: false },
-    { name: 'HKEX',   sheet: 'HKEX',   prefix: 'HKEX',   closeCol: 18, openCol: 19, highCol: 20, lowCol: 21, runAfterIST: '13:35', intraday: false },
-    { name: 'JPX',    sheet: 'JPX',    prefix: 'TK2',    closeCol: 22, openCol: 23, highCol: 24, lowCol: 25, runAfterIST: '12:05', intraday: false },
-    { name: 'ASX',    sheet: 'ASX',    prefix: 'ASX',    closeCol: 26, openCol: 27, highCol: 28, lowCol: 29, runAfterIST: '11:35', intraday: false },
+};
+
+const maxCol = 5;
+const badValues = ['#N/A','#ERROR!','#VALUE!','#REF!','#NUM!','Loading...',''];
+
+const NSE_HOLIDAYS = {
+  2026: [
+    '2026-01-26', // Republic Day
+    '2026-03-03', // Holi
+    '2026-03-26', // Shri Ram Navami
+    '2026-03-31', // Shri Mahavir Jayanti
+    '2026-04-03', // Good Friday
+    '2026-04-14', // Dr. Baba Saheb Ambedkar Jayanti
+    '2026-05-01', // Maharashtra Day
+    '2026-05-28', // Bakri Id
+    '2026-06-26', // Muharram
+    '2026-09-14', // Ganesh Chaturthi
+    '2026-10-02', // Mahatma Gandhi Jayanti
+    '2026-10-20', // Dussehra
+    '2026-11-10', // Diwali-Balipratipada
+    '2026-11-24', // Prakash Gurpurb Sri Guru Nanak Dev
+    '2026-12-25', // Christmas
   ],
 };
 
-const maxCol = Math.max(...CONFIG.MARKETS.map(m => m.lowCol));
-const badValues = ['#N/A','#ERROR!','#VALUE!','#REF!','#NUM!','Loading...',''];
-const GITHUB_TOKEN = '';
-
-// ─── Time helpers ─────────────────────────────────────────────────────────────
-
-function getNowIST() {
-  return new Date(Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'));
+function getDateStr() {
+  return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
 }
 
 function getTimeIST() {
   return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'HH:mm');
 }
 
-function getDayIST() {
-  return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'yyyy-MM-dd');
+function getDateLabelIST() {
+  return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd/MM/yyyy HH:mm');
 }
 
 function minutesSinceMidnight(timeStr) {
@@ -61,17 +61,18 @@ function minutesSinceMidnight(timeStr) {
 
 function isMarketHours() {
   const now = minutesSinceMidnight(getTimeIST());
-  const open = minutesSinceMidnight(CONFIG.NSE_MARKET_OPEN);
-  const close = minutesSinceMidnight(CONFIG.NSE_MARKET_CLOSE);
-  return now >= open && now <= close;
+  return now >= minutesSinceMidnight(CONFIG.NSE_MARKET_OPEN)
+      && now <= minutesSinceMidnight(CONFIG.NSE_MARKET_CLOSE);
 }
 
-function isWeekday() {
-  const day = new Date().getDay();
-  return day >= 1 && day <= 5;
+function isTradingDay() {
+  const d = new Date().getDay();
+  if (d === 0 || d === 6) return false;
+  const today = getDateStr();
+  const year = new Date().getFullYear();
+  const holidays = NSE_HOLIDAYS[year] || [];
+  return !holidays.includes(today);
 }
-
-// ─── HASH COMPARISON ──────────────────────────────────────────────────────────
 
 function computePricesHash(prices) {
   const sorted = Object.keys(prices).sort();
@@ -79,8 +80,6 @@ function computePricesHash(prices) {
   const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, str);
   return digest.map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
 }
-
-// ─── Capture prices from SYMBOLS sheet ────────────────────────────────────────
 
 function captureOHLCSnapshot() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -117,180 +116,116 @@ function captureOHLCSnapshot() {
   return prices;
 }
 
-// ─── Hidden INTRADAY sheet ───────────────────────────────────────────────────
-
-function ensureIntradaySheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(CONFIG.INTRADAY_SHEET);
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.INTRADAY_SHEET);
-    sheet.hideSheet();
-    sheet.getRange(1, 1, 1, 3).setValues([['TS', 'LABEL', 'SYMBOLS']]);
-  }
-  return sheet;
+function nseSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName('NSE');
 }
 
-function appendIntradaySnapshot(prices, ts, label) {
-  if (!prices || Object.keys(prices).length === 0) return;
+function resetSheetDaily() {
+  if (!isTradingDay()) { console.log('[MarketAI] Holiday/weekend — no reset'); return; }
 
-  const sheet = ensureIntradaySheet();
-  const priceStr = JSON.stringify(prices);
-  const cellLimit = 45000;
-
-  if (priceStr.length > cellLimit) {
-    const symKeys = Object.keys(prices).sort();
-    const chunks = [];
-    let cur = {}, curLen = 2;
-    for (const sym of symKeys) {
-      const entry = JSON.stringify(sym) + ':' + JSON.stringify(prices[sym]) + ',';
-      if (curLen + entry.length > cellLimit && Object.keys(cur).length > 0) {
-        chunks.push(JSON.stringify(cur));
-        cur = {};
-        curLen = 2;
-      }
-      cur[sym] = prices[sym];
-      curLen += entry.length;
-    }
-    if (Object.keys(cur).length > 0) chunks.push(JSON.stringify(cur));
-
-    const rows = chunks.map((c, i) => [i === 0 ? ts : null, i === 0 ? label : null, c]);
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 3).setValues(rows);
-  } else {
-    sheet.appendRow([ts, label, priceStr]);
-  }
-}
-
-function readIntradaySnapshots() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.INTRADAY_SHEET);
-  if (!sheet) return [];
-
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
-
-  const data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
-  const groups = {};
-
-  for (const [tsVal, labelVal, pricesStr] of data) {
-    if (!pricesStr) continue;
-    const groupKey = tsVal ? String(tsVal) : '__cont__';
-    if (!groups[groupKey] && tsVal) {
-      groups[groupKey] = { ts: Number(tsVal), label: String(labelVal || ''), prices: {} };
-    }
-    try {
-      Object.assign(groups[groupKey || '__cont__'].prices, JSON.parse(pricesStr));
-    } catch (e) {}
-  }
-
-  return Object.values(groups).filter(g => g.ts > 0 && g.ts < 4102444800000).sort((a, b) => a.ts - b.ts);
-}
-
-function clearIntradaySheet() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.INTRADAY_SHEET);
+  const sheet = nseSheet();
   if (!sheet) return;
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 1) sheet.deleteRows(2, lastRow - 1);
-}
 
-// ─── UPDATE NSE SINGLE ROW ───────────────────────────────────────────────────
+  const today = getDateStr();
+  const props = PropertiesService.getScriptProperties();
+  const lastReset = props.getProperty('sheetResetDate');
+  if (lastReset === today) return;
 
-function updateNSESingleRow(prices) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName('NSE');
-  if (!sheet) { console.warn('[MarketAI] NSE sheet missing'); return; }
-
-  const lastRow = sheet.getLastRow();
-  let existingSymbols = [];
-  if (lastRow > 1) {
-    existingSymbols = sheet.getRange(2, 1, lastRow - 1, 1)
-      .getValues()
-      .map(r => String(r[0] || '').trim())
-      .filter(s => s.length > 0);
+  const lastCol = sheet.getLastColumn();
+  if (lastCol > 1) {
+    sheet.deleteColumns(2, lastCol - 1);
   }
-
-  const maxRows = sheet.getMaxRows();
-  const maxCols = sheet.getMaxColumns();
-  if (maxRows > 1) sheet.deleteRows(2, maxRows - 1);
-  if (maxCols > 2) sheet.deleteColumns(3, maxCols - 2);
-
   sheet.getRange(1, 1).setValue('Symbol').setFontWeight('bold');
-  const nowHeader = new Date();
-  sheet.getRange(1, 2).setValue(nowHeader);
-  sheet.getRange(1, 2).setNumberFormat('dd/MM/yyyy HH:mm');
 
-  const rows = [];
-  for (const sym of existingSymbols) {
-    if (prices[sym] !== undefined) rows.push([sym, prices[sym]]);
-  }
-  for (const sym in prices) {
-    if (!existingSymbols.includes(sym)) rows.push([sym, prices[sym]]);
-  }
-
-  if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, 2).setValues(rows);
-  }
-
-  console.log('[MarketAI] NSE single row updated: ' + rows.length + ' symbols');
+  props.setProperty('sheetResetDate', today);
+  props.deleteProperty('lastSnapshotHash');
+  console.log('[MarketAI] NSE sheet reset for ' + today);
 }
 
-// ─── 1-Min Intraday Capture ───────────────────────────────────────────────────
+function appendMinuteColumn() {
+  if (!isTradingDay()) { console.log('[MarketAI] Holiday/weekend — skip'); return; }
+  if (!isMarketHours()) { console.log('[MarketAI] Outside market hours — skip'); return; }
 
-function captureIntradaySnapshot() {
-  const startTime = Date.now();
-
-  if (!isWeekday()) {
-    console.log('[MarketAI] Weekend — skip');
-    return;
-  }
-  if (!isMarketHours()) {
-    console.log('[MarketAI] Outside market hours (' + getTimeIST() + ') — skip');
-    return;
-  }
-
-  console.log('[MarketAI] Snapshot at ' + getTimeIST());
+  resetSheetDaily();
 
   const prices = captureOHLCSnapshot();
-  if (!prices || Object.keys(prices).length === 0) {
-    console.log('[MarketAI] No valid prices');
-    return;
-  }
+  if (!prices || Object.keys(prices).length === 0) { console.log('[MarketAI] No valid prices'); return; }
 
   const hash = computePricesHash(prices);
   const props = PropertiesService.getScriptProperties();
   const prevHash = props.getProperty('lastSnapshotHash');
+  if (hash === prevHash) { console.log('[MarketAI] No change — skip'); return; }
+  props.setProperty('lastSnapshotHash', hash);
 
-  if (hash === prevHash) {
-    console.log('[MarketAI] No change — skip');
-    return;
+  const sheet = nseSheet();
+  if (!sheet) { console.log('[MarketAI] NSE sheet missing'); return; }
+
+  const label = getDateLabelIST();
+  const syms = Object.keys(prices);
+  const existingSyms = sheet.getLastRow() > 1
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues().map(r => String(r[0] || '').trim())
+    : [];
+
+  const allSyms = [...new Set([...existingSyms, ...syms])];
+  const newCol = sheet.getLastColumn() + 1;
+
+  sheet.getRange(1, newCol).setValue(label);
+  sheet.getRange(1, newCol).setNumberFormat('dd/MM/yyyy HH:mm');
+
+  if (allSyms.length > 0) {
+    if (sheet.getLastRow() < 2) {
+      sheet.getRange(2, 1, allSyms.length, 1).setValues(allSyms.map(s => [s]));
+    }
+    const rows = allSyms.map(sym => [prices[sym] !== undefined ? prices[sym] : '']);
+    sheet.getRange(2, newCol, allSyms.length, 1).setValues(rows);
   }
 
-  const ts = Date.now();
-  const label = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd/MM/yyyy HH:mm');
-
-  appendIntradaySnapshot(prices, ts, label);
-  updateNSESingleRow(prices);
-
-  props.setProperty('lastSnapshotHash', hash);
-  console.log('[MarketAI] Snapshot stored (' + Object.keys(prices).length + ' symbols, ' + ((Date.now()-startTime)/1000).toFixed(1) + 's)');
+  console.log('[MarketAI] Column appended: ' + allSyms.length + ' symbols at ' + label);
 }
 
-// ─── GitHub Sync (EOD) ────────────────────────────────────────────────────────
-
-function syncToGitHub() {
-  const props = PropertiesService.getScriptProperties();
-  const token = props.getProperty('GITHUB_TOKEN') || GITHUB_TOKEN;
-  if (!token) {
-    console.log('[GitHub] No GITHUB_TOKEN available — skipping sync');
-    return;
-  }
+function logStockPrices() {
+  if (!isTradingDay()) { console.log('[MarketAI EOD] Holiday/weekend — skip'); return; }
 
   const startTime = Date.now();
-  const todaySnaps = readIntradaySnapshots();
-  if (todaySnaps.length === 0) {
-    console.log('[GitHub] No intraday snapshots to sync');
+  console.log('[MarketAI EOD] Run at IST ' + getTimeIST());
+
+  const sheet = nseSheet();
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 2) {
+    console.log('[MarketAI EOD] No data in NSE sheet');
     return;
   }
 
-  console.log('[GitHub] Read ' + todaySnaps.length + ' snapshots from _INTRADAY');
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const snapshots = [];
+
+  for (let c = 1; c < headers.length; c++) {
+    const label = String(headers[c] || '').trim();
+    if (!label) continue;
+    const parsed = new Date(label);
+    const ts = parsed.getTime();
+    if (isNaN(ts)) continue;
+
+    const prices = {};
+    for (let r = 1; r < data.length; r++) {
+      const sym = String(data[r][0] || '').trim();
+      if (sym && data[r][c] !== undefined && String(data[r][c]).trim() !== '') {
+        prices[sym] = String(data[r][c]).trim();
+      }
+    }
+    if (Object.keys(prices).length > 0) {
+      snapshots.push({ id: 's_' + ts, ts, label, prices });
+    }
+  }
+
+  if (snapshots.length === 0) {
+    console.log('[MarketAI EOD] No valid snapshots found');
+    return;
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('GITHUB_TOKEN');
+  if (!token) { console.log('[GitHub] No GITHUB_TOKEN set — skipping sync'); return; }
 
   let existing = { snapshots: [], symbols: [], lastSync: null };
   try {
@@ -307,14 +242,14 @@ function syncToGitHub() {
   }
 
   const existingIds = new Set((existing.snapshots || []).map(s => s.id));
-  const toAdd = todaySnaps.filter(s => !existingIds.has('s_' + s.ts));
+  const toAdd = snapshots.filter(s => !existingIds.has(s.id));
   if (toAdd.length === 0) {
     console.log('[GitHub] No new snapshots to add');
     return;
   }
 
   for (const s of toAdd) {
-    existing.snapshots.push({ id: 's_' + s.ts, ts: s.ts, label: s.label, prices: s.prices });
+    existing.snapshots.push(s);
   }
   existing.snapshots.sort((a, b) => a.ts - b.ts);
 
@@ -338,14 +273,11 @@ function syncToGitHub() {
 
   const ok = gitCommitFile(CONFIG.GITHUB_REPO, CONFIG.GITHUB_FILE, content, token, msg);
   if (ok) {
-    console.log('[GitHub] Sync OK: ' + existing.snapshots.length + ' snaps, ' + existing.symbols.length + ' syms (' + ((Date.now()-startTime)/1000).toFixed(1) + 's)');
-    clearIntradaySheet();
+    console.log('[GitHub] Sync OK: ' + existing.snapshots.length + ' snaps (' + ((Date.now()-startTime)/1000).toFixed(1) + 's)');
   } else {
     console.log('[GitHub] Sync FAILED');
   }
 }
-
-// ─── Git Data API helpers ──────────────────────────────────────────────────────
 
 function gitApi(url, token, method, payload) {
   const options = {
@@ -393,278 +325,69 @@ function gitCommitFile(repo, filePath, content, token, message) {
   return updateRes.getResponseCode() === 200;
 }
 
-// ─── EOD Trigger ──────────────────────────────────────────────────────────────
-
-function logStockPrices() {
-  const startTime = Date.now();
-  console.log('[MarketAI EOD] Run at IST ' + getTimeIST());
-
-  const prices = captureOHLCSnapshot();
-  if (prices && Object.keys(prices).length > 0) {
-    const ts = Date.now();
-    const label = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd/MM/yyyy HH:mm');
-    appendIntradaySnapshot(prices, ts, label);
-    updateNSESingleRow(prices);
-    console.log('[MarketAI EOD] Final snapshot appended');
+function setGitHubToken(token) {
+  if (token) {
+    PropertiesService.getScriptProperties().setProperty('GITHUB_TOKEN', token);
   }
-
-  syncToGitHub();
-
-  console.log('[MarketAI EOD] Done in ' + ((Date.now()-startTime)/1000).toFixed(1) + 's');
 }
-
-// ─── SYMBOL COLUMN SYNC ──────────────────────────────────────────────────────
-
-function syncSymbolColumn(marketSheet, latestSymbols) {
-  const lastRow = marketSheet.getLastRow();
-  if (lastRow < 2) {
-    marketSheet.getRange(1, 1).setValue('Symbol').setFontWeight('bold');
-    if (latestSymbols.length) marketSheet.getRange(2,1,latestSymbols.length,1).setValues(latestSymbols.map(s=>[s]));
-    return;
-  }
-  const current = marketSheet.getRange(2,1,lastRow-1,1).getValues().map(r=>String(r[0]||'').trim());
-  const latestSet = new Set(latestSymbols);
-  const toDelete = [];
-  for (let r = 0; r < current.length; r++) {
-    if (current[r] && !latestSet.has(current[r])) toDelete.push(r + 2);
-  }
-  if (toDelete.length > 0) {
-    toDelete.sort((a, b) => b - a);
-    let i = 0;
-    while (i < toDelete.length) {
-      const endRow = toDelete[i];
-      let startRow = endRow;
-      while (i + 1 < toDelete.length && toDelete[i + 1] === startRow - 1) { i++; startRow = toDelete[i]; }
-      marketSheet.deleteRows(startRow, endRow - startRow + 1);
-      i++;
-    }
-  }
-  const deletedSet = new Set(toDelete.map(r => r - 2));
-  const remaining = [];
-  for (let i = 0; i < current.length; i++) { if (!deletedSet.has(i) && current[i]) remaining.push(current[i]); }
-  const remainingSet = new Set(remaining);
-  const toAdd = latestSymbols.filter(s => !remainingSet.has(s));
-  if (toAdd.length) marketSheet.getRange(Math.max(marketSheet.getLastRow()+1,2),1,toAdd.length,1).setValues(toAdd.map(s=>[s]));
-}
-
-function getSymbolColumn(marketSheet) {
-  const lastRow = marketSheet.getLastRow();
-  return lastRow < 2 ? [] : marketSheet.getRange(2,1,lastRow-1,1).getValues().map(r=>String(r[0]||'').trim()).filter(s=>s.length);
-}
-
-// ─── SETUP ────────────────────────────────────────────────────────────────────
 
 function setupAll() {
-  const props = PropertiesService.getScriptProperties();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ui = SpreadsheetApp.getUi();
-
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
 
-  setupMarketSheetsInternal(ss);
-
-  ScriptApp.newTrigger('captureIntradaySnapshot')
+  ScriptApp.newTrigger('resetSheetDaily')
     .timeBased()
-    .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES)
+    .atHour(9)
+    .nearMinute(0)
+    .everyDays(1)
     .create();
-  ScriptApp.newTrigger('logStockPrices').timeBased().atHour(15).nearMinute(40).everyDays(1).create();
 
-  ensureIntradaySheet();
+  ScriptApp.newTrigger('appendMinuteColumn')
+    .timeBased()
+    .everyMinutes(1)
+    .create();
 
-  const now = new Date().toISOString();
-  props.setProperty('SETUP_DONE', now);
-  props.setProperty('SETUP_VERSION', '3.0-github');
-  props.deleteProperty('lastSnapshotHash');
+  ScriptApp.newTrigger('logStockPrices')
+    .timeBased()
+    .atHour(15)
+    .nearMinute(40)
+    .everyDays(1)
+    .create();
 
   const msg =
-    '✅ Full setup complete (' + now.replace('T', ' ').slice(0, 19) + ' IST+5:30)\n\n' +
-    '• SYMBOLS sheet: GOOGLEFINANCE formulas refreshed\n' +
-    '• NSE sheet: single-row format (latest prices)\n' +
-    '• _INTRADAY sheet: created (hidden, for 1-min snapshots)\n' +
-    '• Triggers: intraday every 1 min + EOD/GitHub sync at 15:40\n' +
-    '• GitHub token: pre-configured ✓\n\n' +
-    '• data.json on GitHub: 811 snaps, 2427 symbols migrated from Firebase ✓';
-  try { ui.alert('MarketAI — Setup Complete', msg, ui.ButtonSet.OK); } catch (e) { console.log('[MarketAI] ' + msg); }
-}
+    'Setup complete:\n' +
+    '• Sheet reset: daily at 09:00 IST\n' +
+    '• Intraday: every 1 min (trading days, 9:15-15:30 IST)\n' +
+    '• Appends new column to NSE sheet each minute (no duplicates)\n' +
+    '• EOD sync: 15:40 IST → commits fresh data to GitHub data.json\n' +
+    '• NSE holidays respected ✓\n' +
+    '• ⚠ Set GitHub token via MarketAI → Set GitHub Token';
 
-function setupMarketSheetsInternal(ss) {
-  const symbolsSheet = ss.getSheetByName(CONFIG.SYMBOLS_SHEET);
-
-  if (symbolsSheet) {
-    const hdrLabels = ['SYMBOL'];
-    CONFIG.MARKETS.forEach(m => hdrLabels.push(m.name, m.name + '_OPEN', m.name + '_HIGH', m.name + '_LOW'));
-    const hdrRange = symbolsSheet.getRange(1, 1, 1, hdrLabels.length);
-    hdrRange.setValues([hdrLabels]);
-    hdrRange.setFontWeight('bold');
-
-    const lastRow = symbolsSheet.getLastRow();
-    if (lastRow > 1) {
-      const symValues = symbolsSheet.getRange(2, 1, lastRow - 1, 1).getValues();
-      CONFIG.MARKETS.forEach(market => {
-        [['price', 0], ['open', 1], ['high', 2], ['low', 3]].forEach(([ft, fi]) => {
-          const col = market.closeCol + fi;
-          const formulas = symValues.map((r, ri) => {
-            const sym = String(r[0] || '').trim();
-            return sym ? [`=IF(A${ri + 2}="","",GOOGLEFINANCE("${market.prefix}:"&A${ri + 2},"${ft}"))`] : [''];
-          });
-          symbolsSheet.getRange(2, col, formulas.length, 1).setFormulas(formulas);
-        });
-      });
-    }
-  }
-
-  CONFIG.MARKETS.forEach(market => {
-    let sheet = ss.getSheetByName(market.sheet);
-    if (!sheet) {
-      sheet = ss.insertSheet(market.sheet);
-      sheet.getRange(1, 1).setValue('Symbol').setFontWeight('bold');
-      sheet.getRange(1, 2).setValue('Latest').setFontWeight('bold');
-    } else {
-      const maxCols = sheet.getMaxColumns();
-      if (maxCols > 2) sheet.deleteColumns(3, maxCols - 2);
-      sheet.getRange(1, 1).setValue('Symbol').setFontWeight('bold');
-      sheet.getRange(1, 2).setValue('Latest').setFontWeight('bold');
-      const maxRows = sheet.getMaxRows();
-      if (maxRows > 1) {
-        const symbols = sheet.getRange(2, 1, maxRows - 1, 1).getValues().map(r => String(r[0] || '').trim()).filter(Boolean);
-        if (symbols.length > 0) {
-          const symSheet = ss.getSheetByName(CONFIG.SYMBOLS_SHEET);
-          if (symSheet && symSheet.getLastRow() > 1) {
-            const allSyms = symSheet.getRange(2, 1, symSheet.getLastRow() - 1, 1).getValues().map(r => String(r[0] || '').trim()).filter(Boolean);
-            sheet.getRange(2, 1, sheet.getMaxRows() - 1, 2).clearContent();
-            if (allSyms.length > 0) {
-              sheet.getRange(2, 1, allSyms.length, 1).setValues(allSyms.map(s => [s]));
-            }
-          }
-        }
-      }
-    }
-  });
-}
-
-function setupMarketSheets() {
-  setupMarketSheetsInternal(SpreadsheetApp.getActiveSpreadsheet());
-  try { SpreadsheetApp.getUi().alert('✓ Market Sheets ready with single-row + GitHub architecture'); } catch (e) { console.log('[MarketAI] Market sheets ready'); }
-}
-
-function setupTriggers() {
-  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('captureIntradaySnapshot')
-    .timeBased()
-    .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES)
-    .create();
-  ScriptApp.newTrigger('logStockPrices').timeBased().atHour(15).nearMinute(40).everyDays(1).create();
-  const msg =
-    '✓ Triggers set:\n' +
-    '• Intraday: every 1 min (Mon-Fri 9:15-15:30 IST)\n' +
-    '• EOD/GitHub: 15:40 IST';
-  try { SpreadsheetApp.getUi().alert(msg); } catch (e) { console.log('[MarketAI] ' + msg.replace(/\n/g, ' · ')); }
-}
-
-// ─── TRIGGER MAINTENANCE ─────────────────────────────────────────────────────
-
-const REQUIRED_TRIGGER_FUNCS = ['captureIntradaySnapshot', 'logStockPrices'];
-
-function ensureTriggers() {
-  const existing = ScriptApp.getProjectTriggers();
-  const active = new Set(existing.map(t => t.getHandlerFunction()));
-  const missing = REQUIRED_TRIGGER_FUNCS.filter(f => !active.has(f));
-
-  if (missing.length === 0 && existing.length >= 2) {
-    console.log('[MarketAI] All triggers present');
-    return { repaired: false, missing: [] };
-  }
-
-  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('captureIntradaySnapshot')
-    .timeBased()
-    .everyMinutes(CONFIG.INTRADAY_INTERVAL_MINUTES)
-    .create();
-  ScriptApp.newTrigger('logStockPrices').timeBased().atHour(15).nearMinute(40).everyDays(1).create();
-
-  const msg = missing.length > 0
-    ? 'Repaired ' + missing.length + ' missing trigger(s): ' + missing.join(', ')
-    : 'Re-synced ' + REQUIRED_TRIGGER_FUNCS.length + ' triggers';
-  console.log('[MarketAI] ' + msg);
-  return { repaired: true, missing };
-}
-
-// ─── FORCE FUNCTIONS ─────────────────────────────────────────────────────────
-
-function forceSnapshotNow() {
-  captureIntradaySnapshot();
-}
-function forceEODNow() {
-  logStockPrices();
-}
-function forceGitHubSync() {
-  syncToGitHub();
-}
-function forceRepairTriggersNow() {
-  const result = ensureTriggers();
-  const msg = result.repaired ? '✓ Triggers repaired and re-synced.' : '✓ All triggers present.';
-  try { SpreadsheetApp.getUi().alert(msg); } catch (e) { console.log('[MarketAI] ' + msg); }
-}
-
-// ─── MENU ─────────────────────────────────────────────────────────────────────
-
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  const props = PropertiesService.getScriptProperties();
-  const setupDone = props.getProperty('SETUP_DONE');
-
-  ui.createMenu('MarketAI')
-    .addItem('⚡ Full Setup (one-click)', 'setupAll')
-    .addSeparator()
-    .addSeparator()
-    .addItem('Force Snapshot Now', 'forceSnapshotNow')
-    .addItem('Force EOD + GitHub Sync', 'forceEODNow')
-    .addItem('Force GitHub Sync Only', 'forceGitHubSync')
-    .addSeparator()
-    .addItem('Set GitHub Token', 'setGitHubTokenUI')
-    .addItem('Recreate Market Sheets', 'setupMarketSheets')
-    .addItem('Reset Triggers', 'setupTriggers')
-    .addItem('Repair Triggers', 'forceRepairTriggersNow')
-    .addToUi();
-
-  if (!setupDone) {
-    try {
-      const response = ui.alert(
-        'MarketAI — First-Time Setup',
-        'This sheet needs a one-time setup:\n\n' +
-        '• Install GOOGLEFINANCE formulas in SYMBOLS sheet\n' +
-        '• Create _INTRADAY hidden sheet for intraday snapshots\n' +
-        '• Set 1-minute intraday trigger + EOD/GitHub trigger\n\n' +
-        'Run setup now?',
-        ui.ButtonSet.YES_NO
-      );
-      if (response === ui.Button.YES) {
-        setupAll();
-      } else {
-        props.setProperty('SETUP_DEFERRED', new Date().toISOString());
-        ui.alert('Setup deferred. Run MarketAI → ⚡ Full Setup (one-click) when ready.');
-      }
-    } catch (e) {
-      console.error('[MarketAI] onOpen setup error:', e.message);
-      setupAll();
-    }
-  } else {
-    try { ensureTriggers(); } catch (e) { console.error('[MarketAI] ensureTriggers error:', e.message); }
-  }
+  try { SpreadsheetApp.getUi().alert('MarketAI — Setup Complete', msg, SpreadsheetApp.getUi().ButtonSet.OK); }
+  catch (e) { console.log('[MarketAI] ' + msg); }
 }
 
 function setGitHubTokenUI() {
   const ui = SpreadsheetApp.getUi();
   const response = ui.prompt(
     'Set GitHub Token',
-    'Enter your GitHub PAT (or leave blank to use the pre-configured token):',
+    'Enter your GitHub PAT:',
     ui.ButtonSet.OK_CANCEL
   );
   if (response.getSelectedButton() === ui.Button.OK) {
     const token = response.getResponseText().trim();
-    if (token) {
-      PropertiesService.getScriptProperties().setProperty('GITHUB_TOKEN', token);
-    }
-    ui.alert('✓ GitHub Token ready.');
+    setGitHubToken(token);
+    ui.alert('\u2713 GitHub Token saved.');
   }
+}
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  ui.createMenu('MarketAI')
+    .addItem('\u26A1 Full Setup (one-click)', 'setupAll')
+    .addSeparator()
+    .addItem('Sync to GitHub Now', 'logStockPrices')
+    .addSeparator()
+    .addItem('Set GitHub Token', 'setGitHubTokenUI')
+    .addToUi();
 }

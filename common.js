@@ -585,7 +585,7 @@ function renderSidebar(scrollTop) {
 }
 let _sbScrollTimer;
 
-function openStock(sym) { S.activeStock = sym; nav('stockDetail', { sym }); }
+function openStock(sym) { S.activeStock = sym; nav('stock-detail', { sym }); }
 
 const Pages = {};
 function nav(pg, params = {}) {

@@ -44,14 +44,14 @@ const gas = require('fs').readFileSync('./GoogleAppsScript.js', 'utf8');
 const gasLines = gas.split('\n');
 const fnMatches = gas.match(/function\s+(\w+)/g) || [];
 const fnNames = fnMatches.map(f => f.replace('function ', ''));
-const required = ['captureIntradaySnapshot','logStockPrices','computePricesHash','captureOHLCSnapshot','syncToGitHub',
-  'updateNSESingleRow','syncSymbolColumn','getSymbolColumn','setupMarketSheets','setupMarketSheetsInternal','setupAll','setupTriggers',
-  'isMarketHours','isWeekday',
-  'ensureTriggers','forceRepairTriggersNow','onOpen'];
+const required = ['captureOHLCSnapshot','logStockPrices','setupAll','onOpen',
+  'getTimeIST','gitApi','gitCommitFile','setGitHubToken','setGitHubTokenUI',
+  'appendMinuteColumn','isMarketHours','isTradingDay','computePricesHash',
+  'resetSheetDaily','getDateStr'];
 for (const fn of required) {
   assert(fnNames.includes(fn), `GoogleAppsScript defines ${fn}()`);
 }
-assert(gasLines.length > 400, `GoogleAppsScript is substantial (${gasLines.length} lines)`);
+assert(gasLines.length > 100, `GoogleAppsScript is substantial (${gasLines.length} lines)`);
 
 // ── 5. common.js (syntax check) ──────────────────────────────────────────
 section('5. common.js (syntax check)');

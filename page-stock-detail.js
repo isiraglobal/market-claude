@@ -1,4 +1,4 @@
-Pages.stockDetail = function(el, params = {}) {
+Pages['stock-detail'] = function(el, params = {}) {
   const sym = params.sym || S.activeStock;
   if (!sym) { el.innerHTML = `<div class="empty"><div class="empty-title">No symbol selected</div></div>`; return; }
   S.activeStock = sym;
