@@ -496,9 +496,15 @@ async function fetchFromGitHub() {
 }
 
 async function fetchData() {
-  const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+  if (!isLocal) {
+    const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  }
   try { const r = await fetch(`${API}/api/data`); if (r.ok) { const data = await r.json(); if (data && data.snapshots && data.snapshots.length > 0) return data; } }
   catch (err) { console.warn('API fetch failed', err); }
+  if (isLocal) {
+    const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  }
   try { const cached = JSON.parse(localStorage.getItem('marketai_cache') || '{}'); if (cached.snapshots && cached.snapshots.length > 0) return cached; } catch (e) {}
   const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('fetchData: Google Sheets timeout')), 8000));
   return await Promise.race([fetchFromGoogleSheetsRealtime(), timeout]);
@@ -787,6 +793,14 @@ function generateMockData() {
 }
 
 (function() {
+  // Bind navigation button click listeners
+  document.querySelectorAll('.navlink[data-pg]').forEach(el => {
+    el.addEventListener('click', () => nav(el.dataset.pg));
+  });
+  document.querySelectorAll('.m-nav-item[data-pg]').forEach(el => {
+    el.addEventListener('click', () => nav(el.dataset.pg));
+  });
+
   setLoad(20);
   try { if (typeof initLiquidBg === 'function') initLiquidBg(); } catch (e) { console.warn('Liquid bg init failed:', e); }
   const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
