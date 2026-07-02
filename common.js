@@ -521,27 +521,119 @@ async function fetchFromGitHub() {
 
 async function fetchData() {
   const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+  let baselineData = null;
   if (!isLocal) {
-    const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+    baselineData = await fetchFromGitHub();
   }
-  try { const r = await fetch(`${API}/api/data`); if (r.ok) { const data = await r.json(); if (data && data.snapshots && data.snapshots.length > 0) return data; } }
-  catch (err) { console.warn('API fetch failed', err); }
-  if (isLocal) {
-    try { const r = await fetch('/data.json', { cache: 'no-cache' }); if (r.ok) { const data = await r.json(); if (data && data.snapshots && data.snapshots.length > 0 && data.snapshots[0].prices) { console.log(`[Local] Loaded ${data.snapshots.length} snaps with prices`); return data; } } } catch (e) { console.warn('Local data.json fetch failed:', e); }
-    const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  if (!baselineData) {
+    try {
+      const r = await fetch(`${API}/api/data`);
+      if (r.ok) {
+        const data = await r.json();
+        if (data && data.snapshots && data.snapshots.length > 0) baselineData = data;
+      }
+    } catch (err) { console.warn('API fetch failed', err); }
   }
-  try { const cached = JSON.parse(localStorage.getItem('marketai_cache') || '{}'); if (cached.snapshots && cached.snapshots.length > 0) return cached; } catch (e) {}
-  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('fetchData: Google Sheets timeout')), 8000));
-  return await Promise.race([fetchFromGoogleSheetsRealtime(), timeout]);
+  if (isLocal && !baselineData) {
+    try {
+      const r = await fetch('/data.json', { cache: 'no-cache' });
+      if (r.ok) {
+        const data = await r.json();
+        if (data && data.snapshots && data.snapshots.length > 0 && data.snapshots[0].prices) {
+          console.log(`[Local] Loaded ${data.snapshots.length} snaps with prices`);
+          baselineData = data;
+        }
+      }
+    } catch (e) { console.warn('Local data.json fetch failed:', e); }
+    if (!baselineData) baselineData = await fetchFromGitHub();
+  }
+  if (!baselineData) {
+    try {
+      const cached = JSON.parse(localStorage.getItem('marketai_cache') || '{}');
+      if (cached.snapshots && cached.snapshots.length > 0) baselineData = cached;
+    } catch (e) {}
+  }
+
+  // Fetch today's live data from Google Sheets
+  let sheetsData = null;
+  try {
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('Google Sheets timeout')), 8000));
+    sheetsData = await Promise.race([fetchFromGoogleSheetsRealtime(), timeout]);
+  } catch (err) { console.warn('Google Sheets real-time fetch failed:', err); }
+
+  // Merge historical (from Supabase/baseline) and today's live data (from Sheets)
+  const finalSnapshots = [];
+  const symbolsSet = new Set();
+  
+  if (baselineData && baselineData.snapshots) {
+    baselineData.snapshots.forEach(s => {
+      finalSnapshots.push(s);
+      if (s.prices) Object.keys(s.prices).forEach(sym => symbolsSet.add(sym));
+    });
+  }
+
+  if (sheetsData && sheetsData.snapshots) {
+    const todayStr = new Date().toDateString();
+    sheetsData.snapshots.forEach(s => {
+      const isToday = new Date(s.ts).toDateString() === todayStr;
+      if (isToday) {
+        finalSnapshots.push(s);
+        if (s.prices) Object.keys(s.prices).forEach(sym => symbolsSet.add(sym));
+      }
+    });
+  }
+
+  const dedupedSnaps = dedupeSnapshotsByTs(finalSnapshots);
+  const merged = {
+    snapshots: dedupedSnaps,
+    symbols: Array.from(symbolsSet).sort(),
+    lastSync: Date.now(),
+    syncCount: (baselineData?.syncCount || 0) + 1,
+    portfolio: baselineData?.portfolio || S.portfolio || [],
+    watchlists: baselineData?.watchlists || S.watchlists || [],
+    watchlistItems: baselineData?.watchlistItems || S.watchlistItems || [],
+    alerts: baselineData?.alerts || S.alerts || [],
+    screeners: baselineData?.screeners || S.screeners || []
+  };
+  return merged;
 }
+
 window.fetchStockHistory = async function(sym) {
   try {
     const r = await fetch(`${API}/api/stock-history?sym=${encodeURIComponent(sym)}`);
     if (r.ok) {
       const data = await r.json();
       if (Array.isArray(data)) {
-        Cache.histories[sym] = data;
-        const pr = data.map(s => s.price);
+        // Find today's real-time snapshots in S.snapshots and merge them
+        const todayStr = new Date().toDateString();
+        const todaySnapsForSym = [];
+        if (S.snapshots) {
+          S.snapshots.forEach(s => {
+            const isToday = new Date(s.ts).toDateString() === todayStr;
+            if (isToday && s.prices && s.prices[sym] !== undefined) {
+              const val = s.prices[sym];
+              let price, ohlc;
+              if (typeof val === 'number') {
+                price = val;
+              } else if (val && typeof val === 'object') {
+                price = val.c;
+                ohlc = val;
+              }
+              if (price) {
+                todaySnapsForSym.push({ ts: s.ts, label: s.label, price, ...(ohlc ? { ohlc } : {}) });
+              }
+            }
+          });
+        }
+
+        const mergedMap = {};
+        data.forEach(p => { mergedMap[p.ts] = p; });
+        todaySnapsForSym.forEach(p => { mergedMap[p.ts] = p; });
+        
+        const mergedData = Object.values(mergedMap).sort((a, b) => a.ts - b.ts);
+
+        Cache.histories[sym] = mergedData;
+        const pr = mergedData.map(s => s.price);
         let hi = -Infinity, lo = Infinity, sum = 0;
         for (let i = 0; i < pr.length; i++) {
           const p = pr[i]; if (p > hi) hi = p; if (p < lo) lo = p; sum += p;
@@ -561,7 +653,7 @@ window.fetchStockHistory = async function(sym) {
         }
         const vol = Math.sqrt(retCount ? varSum / retCount : 0) * 100;
         const pctReturn = first > 0 ? (last - first) / first * 100 : 0;
-        Cache.stats[sym] = { hi, lo, avg, first, last, count: data.length, pct: isFinite(pctReturn) ? pctReturn : 0, vol: isFinite(vol) ? vol : 0, prices: pr, series: data };
+        Cache.stats[sym] = { hi, lo, avg, first, last, count: mergedData.length, pct: isFinite(pctReturn) ? pctReturn : 0, vol: isFinite(vol) ? vol : 0, prices: pr, series: mergedData };
         return true;
       }
     }
