@@ -1,7 +1,7 @@
 // api/stock-history.js
 // GET /api/stock-history?sym=SYMBOL -> returns price history for a single symbol
 //
-// If Supabase is configured, it queries snapshots using PostgREST JSONB path extraction.
+// If Supabase is configured, it queries the stock_prices table directly.
 // If not configured, it falls back to extracting it from the local data.json file.
 
 const https = require("https");
@@ -78,8 +78,8 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Query Supabase using JSONB path extraction to fetch only this symbol's prices
-    const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/snapshots?select=ts,label,price:prices->${encodeURIComponent(stockSym)}&order=ts.asc`;
+    // Query Supabase directly on the relational stock_prices table
+    const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/stock_prices?select=ts,label,close,open,high,low&sym=eq.${encodeURIComponent(stockSym)}&order=ts.asc`;
     const options = {
       method: "GET",
       headers: {
@@ -103,18 +103,26 @@ module.exports = async (req, res) => {
           const history = [];
           for (let i = 0; i < rawData.length; i++) {
             const row = rawData[i];
-            if (row && row.price !== null && row.price !== undefined) {
-              const raw = row.price;
-              let price, ohlc;
-              if (typeof raw === 'number') {
-                price = raw;
-              } else if (raw && typeof raw === 'object' && typeof raw.c === 'number') {
-                price = raw.c;
-                ohlc = raw;
+            if (row && row.close !== null && row.close !== undefined) {
+              const close = parseFloat(row.close);
+              const hasOHLC = row.open !== null && row.high !== null && row.low !== null;
+              
+              const item = {
+                ts: parseInt(row.ts, 10),
+                label: row.label,
+                price: close
+              };
+
+              if (hasOHLC) {
+                item.ohlc = {
+                  c: close,
+                  o: parseFloat(row.open),
+                  h: parseFloat(row.high),
+                  l: parseFloat(row.low)
+                };
               }
-              if (price) {
-                history.push({ ts: row.ts, label: row.label, price, ...(ohlc ? { ohlc } : {}) });
-              }
+
+              history.push(item);
             }
           }
           res.writeHead(200, CORS_HEADERS);
