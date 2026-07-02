@@ -298,28 +298,86 @@ function logStockPrices() {
   const supabaseKey = props.getProperty('SUPABASE_KEY');
   if (supabaseUrl && supabaseKey) {
     try {
-      const url = supabaseUrl.replace(/\/$/, '') + '/rest/v1/snapshots';
-      const payload = snapshots.map(s => ({
-        ts: s.ts,
-        label: s.label,
-        prices: s.prices
-      }));
-      const res = UrlFetchApp.fetch(url, {
-        method: 'POST',
-        headers: {
-          'apikey': supabaseKey,
-          'Authorization': 'Bearer ' + supabaseKey,
-          'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates'
-        },
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-      if (res.getResponseCode() === 200 || res.getResponseCode() === 201) {
-        console.log('[Supabase] Sync OK: ' + snapshots.length + ' snaps');
-      } else {
-        console.log('[Supabase] Sync FAILED: Code ' + res.getResponseCode() + ' - ' + res.getContentText());
+      const baseUrl = supabaseUrl.replace(/\/$/, '');
+      
+      // 1. Extract and upsert unique symbols to "stocks" table
+      const symbolsSet = new Set();
+      for (const s of snapshots) {
+        if (s.prices) {
+          for (const sym in s.prices) symbolsSet.add(sym);
+        }
       }
+      const uniqueSymbols = Array.from(symbolsSet);
+      const symbolsPayload = uniqueSymbols.map(sym => ({ sym: sym }));
+      
+      console.log('[Supabase] Upserting ' + uniqueSymbols.length + ' symbols...');
+      const symBatchSize = 500;
+      for (let i = 0; i < symbolsPayload.length; i += symBatchSize) {
+        const chunk = symbolsPayload.slice(i, i + symBatchSize);
+        UrlFetchApp.fetch(baseUrl + '/rest/v1/stocks', {
+          method: 'POST',
+          headers: {
+            'apikey': supabaseKey,
+            'Authorization': 'Bearer ' + supabaseKey,
+            'Content-Type': 'application/json',
+            'Prefer': 'resolution=merge-duplicates'
+          },
+          payload: JSON.stringify(chunk),
+          muteHttpExceptions: true
+        });
+      }
+
+      // 2. Flatten and batch upsert price rows to "stock_prices" table
+      const pricesPayload = [];
+      for (const s of snapshots) {
+        if (s.prices) {
+          for (const sym in s.prices) {
+            const val = s.prices[sym];
+            let close, open = null, high = null, low = null;
+            if (typeof val === 'number') {
+              close = val;
+            } else if (val && typeof val === 'object') {
+              close = val.c;
+              open = val.o;
+              high = val.h;
+              low = val.l;
+            }
+            pricesPayload.push({
+              sym: sym,
+              ts: s.ts,
+              label: s.label,
+              close: close,
+              open: open,
+              high: high,
+              low: low
+            });
+          }
+        }
+      }
+
+      console.log('[Supabase] Upserting ' + pricesPayload.length + ' price rows in batches...');
+      const priceBatchSize = 2000;
+      let okCount = 0;
+      for (let i = 0; i < pricesPayload.length; i += priceBatchSize) {
+        const chunk = pricesPayload.slice(i, i + priceBatchSize);
+        const res = UrlFetchApp.fetch(baseUrl + '/rest/v1/stock_prices', {
+          method: 'POST',
+          headers: {
+            'apikey': supabaseKey,
+            'Authorization': 'Bearer ' + supabaseKey,
+            'Content-Type': 'application/json',
+            'Prefer': 'resolution=merge-duplicates'
+          },
+          payload: JSON.stringify(chunk),
+          muteHttpExceptions: true
+        });
+        if (res.getResponseCode() === 200 || res.getResponseCode() === 201) {
+          okCount += chunk.length;
+        } else {
+          console.log('[Supabase] Price batch upsert failed: Code ' + res.getResponseCode() + ' - ' + res.getContentText().slice(0, 150));
+        }
+      }
+      console.log('[Supabase] Price sync OK: ' + okCount + ' of ' + pricesPayload.length + ' rows upserted');
     } catch (e) {
       console.log('[Supabase] Sync Error: ' + e.message);
     }

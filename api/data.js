@@ -28,20 +28,23 @@ async function fetchSnapshotsFromSupabase(limit = 30) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return null;
   return new Promise((resolve) => {
     try {
-      const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/snapshots?select=ts,label,prices&order=ts.desc&limit=${limit}`;
+      const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/rpc/get_latest_snapshots`;
+      const postData = JSON.stringify({ limit_count: limit });
       const options = {
-        method: "GET",
+        method: "POST",
         headers: {
           apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`
+          Authorization: `Bearer ${SUPABASE_KEY}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(postData)
         }
       };
       const req = https.request(url, options, (res) => {
         let body = "";
         res.on("data", chunk => body += chunk);
         res.on("end", () => {
-          if (res.statusCode !== 200) {
-            console.error(`[Supabase GET error] Code ${res.statusCode}:`, body);
+          if (res.statusCode !== 200 && res.statusCode !== 201) {
+            console.error(`[Supabase RPC error] Code ${res.statusCode}:`, body);
             resolve(null);
             return;
           }
@@ -49,18 +52,19 @@ async function fetchSnapshotsFromSupabase(limit = 30) {
             const data = JSON.parse(body);
             resolve(data);
           } catch (e) {
-            console.error('[Supabase GET parse error]:', e.message);
+            console.error('[Supabase RPC parse error]:', e.message);
             resolve(null);
           }
         });
       });
       req.on("error", (e) => {
-        console.error('[Supabase GET network error]:', e.message);
+        console.error('[Supabase RPC network error]:', e.message);
         resolve(null);
       });
+      req.write(postData);
       req.end();
     } catch (err) {
-      console.error('[Supabase GET error]:', err.message);
+      console.error('[Supabase RPC error]:', err.message);
       resolve(null);
     }
   });
