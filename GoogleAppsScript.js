@@ -210,7 +210,22 @@ function logStockPrices() {
     for (let r = 1; r < data.length; r++) {
       const sym = String(data[r][0] || '').trim();
       if (sym && data[r][c] !== undefined && String(data[r][c]).trim() !== '') {
-        prices[sym] = String(data[r][c]).trim();
+        const val = String(data[r][c]).trim();
+        const parts = val.split(',');
+        if (parts.length === 4) {
+          const cVal = parseFloat(parts[0]);
+          const oVal = parseFloat(parts[1]);
+          const hVal = parseFloat(parts[2]);
+          const lVal = parseFloat(parts[3]);
+          if (isFinite(cVal) && cVal > 0 && isFinite(oVal) && oVal > 0 && isFinite(hVal) && hVal > 0 && isFinite(lVal) && lVal > 0) {
+            prices[sym] = { c: cVal, o: oVal, h: hVal, l: lVal };
+          }
+        } else {
+          const numVal = parseFloat(val);
+          if (isFinite(numVal) && numVal > 0) {
+            prices[sym] = numVal;
+          }
+        }
       }
     }
     if (Object.keys(prices).length > 0) {
@@ -276,6 +291,40 @@ function logStockPrices() {
     console.log('[GitHub] Sync OK: ' + existing.snapshots.length + ' snaps (' + ((Date.now()-startTime)/1000).toFixed(1) + 's)');
   } else {
     console.log('[GitHub] Sync FAILED');
+  }
+
+  // ── Supabase Sync ────────────────────────────────────────────────────────
+  const supabaseUrl = props.getProperty('SUPABASE_URL');
+  const supabaseKey = props.getProperty('SUPABASE_KEY');
+  if (supabaseUrl && supabaseKey) {
+    try {
+      const url = supabaseUrl.replace(/\/$/, '') + '/rest/v1/snapshots';
+      const payload = snapshots.map(s => ({
+        ts: s.ts,
+        label: s.label,
+        prices: s.prices
+      }));
+      const res = UrlFetchApp.fetch(url, {
+        method: 'POST',
+        headers: {
+          'apikey': supabaseKey,
+          'Authorization': 'Bearer ' + supabaseKey,
+          'Content-Type': 'application/json',
+          'Prefer': 'resolution=merge-duplicates'
+        },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+      if (res.getResponseCode() === 200 || res.getResponseCode() === 201) {
+        console.log('[Supabase] Sync OK: ' + snapshots.length + ' snaps');
+      } else {
+        console.log('[Supabase] Sync FAILED: Code ' + res.getResponseCode() + ' - ' + res.getContentText());
+      }
+    } catch (e) {
+      console.log('[Supabase] Sync Error: ' + e.message);
+    }
+  } else {
+    console.log('[Supabase] No credentials set — skipping sync');
   }
 }
 

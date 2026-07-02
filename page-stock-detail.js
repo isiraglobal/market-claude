@@ -104,5 +104,15 @@ Pages['stock-detail'] = function(el, params = {}) {
     } catch (e) { el.innerHTML = 'AI analysis unavailable (GROQ_API_KEY needed).'; }
   };
 
-  render();
+  async function init() {
+    el.innerHTML = `<div class="empty"><div class="ai-spinner"><div class="spin-ring"></div>Loading price history for ${sym}...</div></div>`;
+    const ok = await fetchStockHistory(sym);
+    if (!ok && (!Cache.histories[sym] || Cache.histories[sym].length === 0)) {
+      el.innerHTML = `<div class="empty"><div class="empty-title">Failed to load history</div><div class="empty-sub">Check your connection.</div></div>`;
+      return;
+    }
+    render();
+  }
+
+  init();
 };

@@ -17,9 +17,54 @@ const USER_FILE = path.join(__dirname, "../userdata.json");
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
 // Local in-memory cache for user data (market data is always fresh from KV)
 let cachedUserData = null;
 let cachedUserMtime = 0;
+
+async function fetchSnapshotsFromSupabase(limit = 30) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return null;
+  return new Promise((resolve) => {
+    try {
+      const url = `${SUPABASE_URL.replace(/\/$/, '')}/rest/v1/snapshots?select=ts,label,prices&order=ts.desc&limit=${limit}`;
+      const options = {
+        method: "GET",
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`
+        }
+      };
+      const req = https.request(url, options, (res) => {
+        let body = "";
+        res.on("data", chunk => body += chunk);
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            console.error(`[Supabase GET error] Code ${res.statusCode}:`, body);
+            resolve(null);
+            return;
+          }
+          try {
+            const data = JSON.parse(body);
+            resolve(data);
+          } catch (e) {
+            console.error('[Supabase GET parse error]:', e.message);
+            resolve(null);
+          }
+        });
+      });
+      req.on("error", (e) => {
+        console.error('[Supabase GET network error]:', e.message);
+        resolve(null);
+      });
+      req.end();
+    } catch (err) {
+      console.error('[Supabase GET error]:', err.message);
+      resolve(null);
+    }
+  });
+}
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -169,8 +214,33 @@ module.exports = async (req, res) => {
     let market = null;
     let user = null;
 
-    // 1. Try KV for market + user data
-    if (KV_URL && KV_TOKEN) {
+    // 1. Try Supabase first (loads last 30 snapshots, very fast)
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      try {
+        const snaps = await fetchSnapshotsFromSupabase(30);
+        if (snaps && snaps.length > 0) {
+          const sortedSnaps = snaps.sort((a, b) => a.ts - b.ts);
+          const symbolsSet = new Set();
+          for (const s of sortedSnaps) {
+            if (s.prices) {
+              for (const sym in s.prices) symbolsSet.add(sym);
+            }
+          }
+          market = {
+            snapshots: sortedSnaps,
+            symbols: Array.from(symbolsSet).sort(),
+            lastSync: sortedSnaps.length > 0 ? sortedSnaps[sortedSnaps.length - 1].ts : null,
+            syncCount: 1
+          };
+          console.log(`[Supabase] Loaded ${market.snapshots.length} snapshots`);
+        }
+      } catch (err) {
+        console.error('[Supabase GET failed, falling back]:', err.message);
+      }
+    }
+
+    // 2. Try KV for market + user data
+    if (!market && KV_URL && KV_TOKEN) {
       [market, user] = await Promise.all([getMarketData(), kvGet("user-data")]);
     }
 

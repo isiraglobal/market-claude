@@ -201,9 +201,19 @@ function computeHammers() {
     for (let hammerIdx = 14; hammerIdx < len - 1; hammerIdx++) {
       if (runningDownSum >= 12) {
         const prevPrice = priceArr[hammerIdx - 1], hammerPrice = priceArr[hammerIdx], nextPrice = priceArr[hammerIdx + 1];
-        const open = prevPrice, close = hammerPrice;
-        const high = prevPrice > hammerPrice ? prevPrice : hammerPrice;
-        const low = prevPrice < hammerPrice ? prevPrice : hammerPrice;
+        const item = history[hammerIdx];
+        let open, close, high, low;
+        if (item.ohlc) {
+          open = item.ohlc.o;
+          close = item.ohlc.c;
+          high = item.ohlc.h;
+          low = item.ohlc.l;
+        } else {
+          open = prevPrice;
+          close = hammerPrice;
+          high = prevPrice > hammerPrice ? prevPrice : hammerPrice;
+          low = prevPrice < hammerPrice ? prevPrice : hammerPrice;
+        }
         const body = Math.abs(close - open) || (hammerPrice * 0.001);
         const upperShadow = high - (open > close ? open : close);
         const lowerShadow = (open < close ? open : close) - low;
@@ -388,6 +398,20 @@ function parseSheetPrice(raw) {
   if (raw === null || raw === undefined) return null;
   if (typeof raw === 'number') return isFinite(raw) && raw > 0 ? raw : null;
   let s = cleanStr(raw); if (!s || ["#N/A", "N/A", "#VALUE!", "#REF!", "#ERROR!", "#NUM!", "Loading...", ""].includes(s)) return null;
+  
+  if (s.includes(',')) {
+    const parts = s.split(',');
+    if (parts.length === 4) {
+      const c = parseFloat(parts[0]);
+      const o = parseFloat(parts[1]);
+      const h = parseFloat(parts[2]);
+      const l = parseFloat(parts[3]);
+      if (isFinite(c) && c > 0 && isFinite(o) && o > 0 && isFinite(h) && h > 0 && isFinite(l) && l > 0) {
+        return { c, o, h, l };
+      }
+    }
+  }
+
   let n = parseFloat(s); if (isNaN(n)) n = parseFloat(s.replace(/[^\d.-]/g, ""));
   return isFinite(n) && n > 0 ? n : null;
 }
@@ -496,13 +520,54 @@ async function fetchFromGitHub() {
 }
 
 async function fetchData() {
-  const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+  if (!isLocal) {
+    const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  }
   try { const r = await fetch(`${API}/api/data`); if (r.ok) { const data = await r.json(); if (data && data.snapshots && data.snapshots.length > 0) return data; } }
   catch (err) { console.warn('API fetch failed', err); }
+  if (isLocal) {
+    try { const r = await fetch('/data.json', { cache: 'no-cache' }); if (r.ok) { const data = await r.json(); if (data && data.snapshots && data.snapshots.length > 0 && data.snapshots[0].prices) { console.log(`[Local] Loaded ${data.snapshots.length} snaps with prices`); return data; } } } catch (e) { console.warn('Local data.json fetch failed:', e); }
+    const ghData = await fetchFromGitHub(); if (ghData) return ghData;
+  }
   try { const cached = JSON.parse(localStorage.getItem('marketai_cache') || '{}'); if (cached.snapshots && cached.snapshots.length > 0) return cached; } catch (e) {}
   const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('fetchData: Google Sheets timeout')), 8000));
   return await Promise.race([fetchFromGoogleSheetsRealtime(), timeout]);
 }
+window.fetchStockHistory = async function(sym) {
+  try {
+    const r = await fetch(`${API}/api/stock-history?sym=${encodeURIComponent(sym)}`);
+    if (r.ok) {
+      const data = await r.json();
+      if (Array.isArray(data)) {
+        Cache.histories[sym] = data;
+        const pr = data.map(s => s.price);
+        let hi = -Infinity, lo = Infinity, sum = 0;
+        for (let i = 0; i < pr.length; i++) {
+          const p = pr[i]; if (p > hi) hi = p; if (p < lo) lo = p; sum += p;
+        }
+        const avg = pr.length ? sum / pr.length : 0;
+        const first = pr[0], last = pr[pr.length - 1];
+        let retSum = 0, retCount = 0;
+        for (let i = 1; i < pr.length; i++) {
+          const ret = (pr[i] - pr[i - 1]) / pr[i - 1];
+          if (isFinite(ret)) { retSum += ret; retCount++; }
+        }
+        const mean = retCount ? retSum / retCount : 0;
+        let varSum = 0;
+        for (let i = 1; i < pr.length; i++) {
+          const ret = (pr[i] - pr[i - 1]) / pr[i - 1];
+          if (isFinite(ret)) { const d = ret - mean; varSum += d * d; }
+        }
+        const vol = Math.sqrt(retCount ? varSum / retCount : 0) * 100;
+        const pctReturn = first > 0 ? (last - first) / first * 100 : 0;
+        Cache.stats[sym] = { hi, lo, avg, first, last, count: data.length, pct: isFinite(pctReturn) ? pctReturn : 0, vol: isFinite(vol) ? vol : 0, prices: pr, series: data };
+        return true;
+      }
+    }
+  } catch (e) { console.error('[MarketAI] fetchStockHistory error:', e); }
+  return false;
+};
 async function saveUserData() {
   try { const cached = JSON.parse(localStorage.getItem('marketai_cache') || '{}'); cached.portfolio = S.portfolio; cached.watchlists = S.watchlists; cached.watchlistItems = S.watchlistItems; cached.alerts = S.alerts; cached.screeners = S.screeners; localStorage.setItem('marketai_cache', JSON.stringify(cached)); } catch (e) {}
   await fetch(`${API}/api/data`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ portfolio: S.portfolio, watchlists: S.watchlists, watchlistItems: S.watchlistItems, alerts: S.alerts, screeners: S.screeners }) });
@@ -618,18 +683,69 @@ function glCard(title, list) {
 function getAllPatterns() {
   const out = [];
   for (const sym of S.symbols) {
-    const sr = series(sym); const pr = sr.map(s => s.price).filter(p => typeof p === 'number' && isFinite(p) && p > 0);
-    if (pr.length < 3) continue;
-    for (let i = 2; i < pr.length; i++) {
-      const [a, b, cur] = [pr[i - 2], pr[i - 1], pr[i]]; if (!isFinite(a) || !isFinite(b) || !isFinite(cur) || a <= 0 || b <= 0 || cur <= 0) continue;
-      const body = Math.abs(cur - b); const rng = Math.max(a, b, cur) - Math.min(a, b, cur) || 1;
-      if (a > b && cur > b && (cur - b) / (a - b || 1) > 0.5) { const score = Math.min(100, Math.round(((cur - b) / (a - b || 1)) * 70)); if (score >= 40) out.push({ sym, type: 'hammer', ts: sr[i].ts, label: sr[i].label, score, volSpike: score >= 60 }); }
-      if (body / rng < 0.1 && rng > 0 && a > b * 0.99 && a < b * 1.01) out.push({ sym, type: 'doji', ts: sr[i].ts, label: sr[i].label, score: 50, volSpike: false });
-      if (i >= 2 && Math.abs(cur - b) > Math.abs(b - a) * 1.4 && (cur - b) * (b - a) < 0) { const absSize = (cur - b) / (b - a || 1); const score = Math.min(100, Math.round(Math.abs(absSize) * 65)); if (score >= 50) out.push({ sym, type: 'engulfing', ts: sr[i].ts, label: sr[i].label, score, volSpike: score >= 70 }); }
+    const sr = series(sym);
+    if (sr.length < 3) continue;
+    for (let i = 2; i < sr.length; i++) {
+      const prev2 = sr[i - 2], prev1 = sr[i - 1], item = sr[i];
+      const nextItem = i < sr.length - 1 ? sr[i + 1] : null;
+      let o, c, h, l;
+      if (item.ohlc) { o = item.ohlc.o; c = item.ohlc.c; h = item.ohlc.h; l = item.ohlc.l; }
+      else { o = prev1.price; c = item.price; h = o > c ? o : c; l = o < c ? o : c; }
+      if (!isFinite(o) || !isFinite(c) || !isFinite(h) || !isFinite(l) || o <= 0 || c <= 0 || h <= 0 || l <= 0) continue;
+      const body = Math.abs(c - o);
+      const range = h - l || 0.001;
+      const upperShadow = h - (o > c ? o : c);
+      const lowerShadow = (o < c ? o : c) - l;
+      
+      // Hammer check
+      const isHammer = upperShadow < body && lowerShadow > body && lowerShadow > (body * 0.5);
+      if (isHammer) {
+        const shadowRatio = lowerShadow / (upperShadow || 1);
+        const bodySmallness = Math.max(0, 1 - ((body / c) * 100 / 2));
+        const strength = Math.min(100, Math.round((shadowRatio * 40) + (bodySmallness * 60)));
+        let score = 50 + (strength * 0.3);
+        if (nextItem && (nextItem.price - c) / c > 0.005) score += 15;
+        if (lowerShadow / h > 0.2) score += 10;
+        score = Math.min(100, Math.round(score));
+        if (score >= 40) {
+          out.push({ sym, type: 'hammer', ts: item.ts, label: item.label, score, volSpike: score >= 60 });
+        }
+      }
+      
+      // Doji check
+      const isDoji = (body / range < 0.1) && range > 0;
+      if (isDoji && !isHammer) {
+        out.push({ sym, type: 'doji', ts: item.ts, label: item.label, score: 50, volSpike: false });
+      }
+      
+      // Engulfing check
+      let p2_o, p2_c;
+      if (prev1.ohlc) { p2_o = prev1.ohlc.o; p2_c = prev1.ohlc.c; }
+      else { p2_o = prev2.price; p2_c = prev1.price; }
+      const p2_body = Math.abs(p2_c - p2_o);
+      const isEngulfing = body > p2_body * 1.4 && (c - o) * (p2_c - p2_o) < 0;
+      if (isEngulfing) {
+        const absSize = body / (p2_body || 1);
+        const score = Math.min(100, Math.round(Math.abs(absSize) * 65));
+        if (score >= 50) {
+          out.push({ sym, type: 'engulfing', ts: item.ts, label: item.label, score, volSpike: score >= 70 });
+        }
+      }
     }
-    for (let i = 3; i < pr.length; i++) {
-      const [a, b, c, d] = [pr[i - 3], pr[i - 2], pr[i - 1], pr[i]]; if (!isFinite(a) || !isFinite(b) || !isFinite(c) || !isFinite(d) || a <= 0 || b <= 0 || c <= 0 || d <= 0) continue;
-      if (a > b && c > b && d > a * 0.98 && d > c && Math.abs(b - a) / a < 0.03) out.push({ sym, type: 'morning_star', ts: sr[i].ts, label: sr[i].label, score: 75, volSpike: true });
+    
+    // Morning Star
+    for (let i = 3; i < sr.length; i++) {
+      const prev3 = sr[i - 3], prev2 = sr[i - 2], prev1 = sr[i - 1], item = sr[i];
+      let o1, c1, o2, c2, o3, c3;
+      if (prev2.ohlc) { o1 = prev2.ohlc.o; c1 = prev2.ohlc.c; } else { o1 = prev3.price; c1 = prev2.price; }
+      if (prev1.ohlc) { o2 = prev1.ohlc.o; c2 = prev1.ohlc.c; } else { o2 = prev2.price; c2 = prev1.price; }
+      if (item.ohlc) { o3 = item.ohlc.o; c3 = item.ohlc.c; } else { o3 = prev1.price; c3 = item.price; }
+      const isDown1 = c1 < o1;
+      const isStar2 = Math.abs(c2 - o2) / ((o2 + c2) / 2 || 1) < 0.01;
+      const isUp3 = c3 > o3 && c3 > (o1 + c1) / 2;
+      if (isDown1 && isStar2 && isUp3) {
+        out.push({ sym, type: 'morning_star', ts: item.ts, label: item.label, score: 75, volSpike: true });
+      }
     }
   }
   return out.sort((a, b) => b.ts - a.ts).slice(0, 100);
@@ -787,6 +903,14 @@ function generateMockData() {
 }
 
 (function() {
+  // Bind navigation button click listeners
+  document.querySelectorAll('.navlink[data-pg]').forEach(el => {
+    el.addEventListener('click', () => nav(el.dataset.pg));
+  });
+  document.querySelectorAll('.m-nav-item[data-pg]').forEach(el => {
+    el.addEventListener('click', () => nav(el.dataset.pg));
+  });
+
   setLoad(20);
   try { if (typeof initLiquidBg === 'function') initLiquidBg(); } catch (e) { console.warn('Liquid bg init failed:', e); }
   const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
