@@ -89,6 +89,20 @@ function captureOHLCSnapshot() {
   const lastRow = symbolsSheet.getLastRow();
   if (lastRow < 2) return null;
 
+  // Clear and rewrite GOOGLEFINANCE formulas to break Google Sheets caching when spreadsheet is closed
+  const range = symbolsSheet.getRange(2, 2, lastRow - 1, 4); // Columns B, C, D, E
+  const formulas = range.getFormulas();
+  if (formulas && formulas.length > 0 && formulas[0].length > 0) {
+    console.log('[MarketAI] Forcing GOOGLEFINANCE formulas to refresh...');
+    range.clearContent();
+    SpreadsheetApp.flush();
+    Utilities.sleep(1000); // Wait 1 sec
+    range.setFormulas(formulas);
+    SpreadsheetApp.flush();
+    console.log('[MarketAI] Formulas re-written. Waiting 6 seconds for Google Sheets recalculation...');
+    Utilities.sleep(6000); // Wait 6 seconds for values to load
+  }
+
   const allData = symbolsSheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
   const prices = {};
 
